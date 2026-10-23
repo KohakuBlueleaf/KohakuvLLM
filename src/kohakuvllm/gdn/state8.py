@@ -278,8 +278,12 @@ class Chunk8(torch.nn.Module):
     def forward(self, *args, initial_state=None, **kw):
         if initial_state is None or initial_state.dtype != torch.uint8:
             return self.inner(*args, initial_state=initial_state, **kw)
-        fmt = _FORMAT["name"]
         k = initial_state.shape[-1] - SCALE_BYTES
+        if k != kw["k"].shape[-1]:
+            # vLLM's prefill warmup: a zero state of the pool's dtype, unpacked ([..., V, K])
+            zeros = torch.zeros(initial_state.shape, dtype=torch.float32, device=kw["k"].device)
+            return self.inner(*args, initial_state=zeros, **kw)
+        fmt = _FORMAT["name"]
         out, final = self.inner(*args, initial_state=dequantize(initial_state, k, fmt), **kw)
         return out, quantize(final, torch.empty_like(initial_state), fmt)
 
