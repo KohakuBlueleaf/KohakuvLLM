@@ -1,8 +1,9 @@
 """vLLM's ``AsyncLLM`` behind our frontend: requests are prepared in worker processes
 (``prep.Preparer``) and their images encoded by our vision tower (``vision.VisionEncoder``), then
 handed to the engine as prompt token ids with ``image_embeds``; vLLM tokenizes nothing and runs
-no image processor or encoder. The engine needs ``enable_mm_embeds=True`` (``engine_args``
-adds it).
+no image processor or encoder. The engine needs ``enable_mm_embeds=True`` and its own encoder's
+compilation and CUDA graphs off (vLLM 0.32's encoder graph manager reads ``pixel_values`` and
+fails on embeddings); ``engine_args`` sets both.
 """
 
 import asyncio
@@ -17,7 +18,12 @@ from kohakuvllm.front.vision import VisionEncoder
 
 def engine_args(args: dict) -> dict:
     """``args`` with what this frontend needs from the engine."""
-    return {**args, "enable_mm_embeds": True}
+    compilation = {
+        **(args.get("compilation_config") or {}),
+        "compile_mm_encoder": False,
+        "cudagraph_mm_encoder": False,
+    }
+    return {**args, "enable_mm_embeds": True, "compilation_config": compilation}
 
 
 class Frontend:
