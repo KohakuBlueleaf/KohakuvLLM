@@ -26,6 +26,7 @@ def main() -> int:
     p.add_argument("--k", type=int, default=20)
     p.add_argument("--util", type=float, default=0.55)
     p.add_argument("--eager", action="store_true", help="no CUDA graphs, no torch.compile")
+    p.add_argument("--engine", default="{}", help="more vLLM engine arguments, JSON")
     args = p.parse_args()
     tok = AutoTokenizer.from_pretrained(args.model)
     with open(args.data, encoding="utf-8") as f:
@@ -46,6 +47,7 @@ def main() -> int:
         limit_mm_per_prompt={"image": 1, "video": 0},
         max_logprobs=args.k,
         enforce_eager=args.eager,
+        **json.loads(args.engine),
     )
     sp = SamplingParams(max_tokens=1, prompt_logprobs=args.k, temperature=0.0)
     outs = llm.generate(prompts, sp, use_tqdm=False)
