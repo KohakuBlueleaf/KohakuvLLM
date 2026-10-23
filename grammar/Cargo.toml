@@ -1,0 +1,22 @@
+[package]
+name = "kohakuvllm-grammar"
+version = "0.0.1"
+edition = "2021"
+description = "JSON-schema token masks for vLLM: a byte-level matcher with memoised masks"
+license = "Apache-2.0"
+
+[lib]
+name = "kohakuvllm_grammar"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+python = ["dep:pyo3"]
+
+[dependencies]
+pyo3 = { version = "0.25", features = ["extension-module", "abi3-py310"], optional = true }
+serde_json = { version = "1", features = ["preserve_order"] }
+rustc-hash = "2"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1

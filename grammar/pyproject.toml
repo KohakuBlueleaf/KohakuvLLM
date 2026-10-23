@@ -1,0 +1,14 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "kohakuvllm-grammar"
+version = "0.0.1"
+description = "JSON-schema token masks for vLLM (KohakuvLLM's grammar logits processor)"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+
+[tool.maturin]
+features = ["python"]
+module-name = "kohakuvllm_grammar"
