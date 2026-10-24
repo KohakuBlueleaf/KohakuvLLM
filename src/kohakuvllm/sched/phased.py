@@ -5,8 +5,9 @@ balancing) with its saturation escape turned off, so they are uniform decode bat
 full CUDA graphs, which a hybrid GDN model cannot do for a mixed batch. ``KOHAKU_PREFILL_EVERY``
 (4): one step in that many admits prefill; 1 is vLLM's own scheduling.
 
-It pays under a stream of short requests (GBC's replay on an RTX 5090: 9.2 -> 14.9 requests/s)
-and costs under a saturated offline queue (17.8 -> 14.8), where prefill batches best freely.
+With a grammar that defers nothing in the scheduler (``kohakuvllm.grammar``) it pays under
+image + JSON-schema requests (RTX 5090: 30.1 -> 35.0 requests/s); with xgrammar, and under a
+saturated offline queue of uniform text prompts (17.8 -> 14.8), it costs.
 
     vllm serve ... --scheduler-cls kohakuvllm.sched.PhasedScheduler
 """
