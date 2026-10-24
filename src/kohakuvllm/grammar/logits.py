@@ -14,8 +14,8 @@ only, never for the forward in flight.
 
     vllm serve MODEL --logits-processors kohakuvllm.grammar:JsonSchemaLogits
 
-``KOHAKU_GRAMMAR_WS``: whitespace bytes allowed in each gap between JSON tokens (0: compact
-JSON). Spec decoding is not handled.
+``KOHAKU_GRAMMAR_WS``: whitespace bytes allowed in each gap between JSON tokens (8; 0: compact
+JSON, where Qwen3.5 runs some replies to max_tokens). Spec decoding is not handled.
 """
 
 import json
@@ -67,7 +67,7 @@ class JsonSchemaLogits(LogitsProcessor):
         mc = vllm_config.model_config
         tok = AutoTokenizer.from_pretrained(mc.tokenizer, trust_remote_code=mc.trust_remote_code)
         vocab = req_states.vocab_size
-        ws = int(os.environ.get("KOHAKU_GRAMMAR_WS", "0"))
+        ws = int(os.environ.get("KOHAKU_GRAMMAR_WS", "8"))
         self.store = Store(token_bytes(tok, vocab), eos_ids(tok, mc.model), vocab, ws)
         self.rs = req_states
         self.device = req_states.device

@@ -1,8 +1,10 @@
-"""A plain recursive-descent judge of compact JSON against a schema, written apart from the Rust
-matcher: ``judge(schema, data)`` is ``"complete"`` (a whole valid document), ``"prefix"`` (the
-start of one) or ``"bad"``. Strings are JSON strings (escapes, no raw control bytes, UTF-8),
-lengths counted in characters; numbers are JSON numbers (``integer``: no fraction, no exponent;
-at most 24 digits, as the matcher bounds them)."""
+"""A plain recursive-descent judge of JSON against a schema, written apart from the Rust matcher:
+``judge(schema, data, ws)`` is ``"complete"`` (a whole valid document), ``"prefix"`` (the start of
+one) or ``"bad"``. Strings are JSON strings (escapes, no raw control bytes, UTF-8), lengths
+counted in characters; numbers are JSON numbers (``integer``: no fraction, no exponent; at most
+24 digits, as the matcher bounds them). Whitespace: at most ``ws`` bytes in each gap inside an
+object or array (after ``{`` ``[`` ``,`` ``:``, a key, a value), none before or after the
+document."""
 
 import json
 
@@ -16,16 +18,27 @@ class Bad(Exception):
 
 
 MAX_DIGITS = 24
+WS = b" \n\t\r"
 
 
 class Judge:
-    def __init__(self, data: bytes):
+    def __init__(self, data: bytes, ws: int = 0):
         self.d = data
+        self.ws = ws
 
     def peek(self, i: int) -> int:
         if i >= len(self.d):
             raise Prefix
         return self.d[i]
+
+    def gap(self, i: int) -> int:
+        n = 0
+        while self.peek(i) in WS:
+            n += 1
+            if n > self.ws:
+                raise Bad
+            i += 1
+        return i
 
     def lit(self, i: int, text: bytes) -> int:
         for k, b in enumerate(text):
@@ -74,7 +87,7 @@ class Judge:
     def obj(self, s: dict, i: int) -> int:
         props = list(s.get("properties", {}).items())
         req = set(s.get("required", []))
-        i = self.lit(i, b"{")
+        i = self.gap(self.lit(i, b"{"))
         nxt = 0
         first = True
         while True:
@@ -84,7 +97,7 @@ class Judge:
                     raise Bad
                 return i + 1
             if not first:
-                i = self.lit(i, b",")
+                i = self.gap(self.lit(i, b","))
             first = False
             cands = []
             for j, (k, _) in enumerate(rest):
@@ -96,13 +109,13 @@ class Judge:
             keys = {_dump(props[c][0]): c for c in cands}
             end = self.literals([props[c][0] for c in cands], i)
             c = keys[self.d[i:end]]
-            i = self.lit(end, b":")
-            i = self.value(props[c][1], i)
+            i = self.gap(self.lit(self.gap(end), b":"))
+            i = self.gap(self.value(props[c][1], i))
             nxt = c + 1
 
     def arr(self, s: dict, i: int) -> int:
         lo, hi = s.get("minItems", 0), s.get("maxItems")
-        i = self.lit(i, b"[")
+        i = self.gap(self.lit(i, b"["))
         n = 0
         while True:
             if self.peek(i) == ord("]"):
@@ -110,10 +123,10 @@ class Judge:
                     raise Bad
                 return i + 1
             if n:
-                i = self.lit(i, b",")
+                i = self.gap(self.lit(i, b","))
             if hi is not None and n >= hi:
                 raise Bad
-            i = self.value(s["items"], i)
+            i = self.gap(self.value(s["items"], i))
             n += 1
 
     def string(self, i: int, lo: int, hi) -> int:
@@ -197,9 +210,9 @@ def _dump(v) -> bytes:
     return json.dumps(v, ensure_ascii=False, separators=(",", ":")).encode()
 
 
-def judge(schema: dict, data: bytes) -> str:
+def judge(schema: dict, data: bytes, ws: int = 0) -> str:
     try:
-        end = Judge(data).value(schema, 0)
+        end = Judge(data, ws).value(schema, 0)
     except Prefix:
         return "prefix"
     except Bad:

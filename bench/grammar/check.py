@@ -1,17 +1,18 @@
 """KohakuvLLM's grammar masks (``kohakuvllm_grammar``) against xgrammar's and an independent
 judge (``reference.py``), token by token.
 
-For each schema, the compact JSON grammar (no whitespace; xgrammar with ``any_whitespace=False``,
-separators ``,`` ``:``) is walked along two kinds of paths: documents generated to the schema
-(strings at and near their limits, escapes, multi-byte characters, arrays at their item limits),
-tokenized; and random walks that pick each next token uniformly from our mask. At every step
+For each schema, the JSON grammar with at most ``--ws`` whitespace bytes per gap (0: compact;
+xgrammar with ``any_whitespace=False`` and separators ``,`` ``:``, or ``max_whitespace_cnt``) is
+walked along two kinds of paths: documents generated to the schema (strings at and near their
+limits, escapes, multi-byte characters, arrays at their item limits, gaps of 0 to ``--ws``
+whitespace bytes), tokenized; and random walks that pick each next token uniformly from our mask. At every step
 both masks are compared over the whole vocabulary. The judge decides the tokens the two masks
 disagree on (all of them, or a random ``--diff-cap`` of them), end-of-sequence, and (every
 ``--judge-every`` steps) a random sample of the vocabulary, so each side's errors are counted
 against the JSON and schema rules themselves; examples are kept (no threshold). Then CPU time per
 mask: ours (memoised; the first build of each counted apart) and xgrammar's fill.
 
-    python bench/grammar/check.py --model DIR --schemas DIR [--docs 40] [--walks 40] [--out r.json]
+    python bench/grammar/check.py --model DIR --schemas DIR [--ws 0] [--docs 40] [--walks 40]
 """
 
 import argparse
@@ -67,22 +68,42 @@ def instance(schema: dict, rng: random.Random):
     raise ValueError(f"unsupported {schema}")
 
 
+def spaced(v, rng: random.Random, ws: int) -> str:
+    """``v`` as JSON with 0 to ``ws`` whitespace bytes in each gap the grammar allows."""
+
+    def gap() -> str:
+        return "".join(rng.choice(" \n\t\r") for _ in range(rng.randint(0, ws)))
+
+    def join(elems: list[str]) -> str:
+        return "".join(("," + gap() if k else "") + e + gap() for k, e in enumerate(elems))
+
+    if isinstance(v, dict):
+        items = [
+            json.dumps(k, ensure_ascii=False) + gap() + ":" + gap() + spaced(x, rng, ws)
+            for k, x in v.items()
+        ]
+        return "{" + gap() + join(items) + "}"
+    if isinstance(v, list):
+        return "[" + gap() + join([spaced(x, rng, ws) for x in v]) + "]"
+    return json.dumps(v, ensure_ascii=False)
+
+
 def unpack(words: np.ndarray, vocab: int) -> np.ndarray:
     return np.unpackbits(words.view(np.uint8), bitorder="little")[:vocab].astype(bool)
 
 
 class Checker:
-    def __init__(self, store, pieces, vocab, eos, bitmask, rng, judge_every, sample, diff_cap):
-        self.store, self.pieces, self.vocab, self.eos = store, pieces, vocab, eos
+    def __init__(self, store, pieces, vocab, eos, ws, bitmask, rng, judge_every, sample, diff_cap):
+        self.store, self.pieces, self.vocab, self.eos, self.ws = store, pieces, vocab, eos, ws
         self.bitmask, self.rng = bitmask, rng
         self.judge_every, self.sample, self.diff_cap = judge_every, sample, diff_cap
         self.ours_s = self.xgr_s = 0.0
 
     def allowed(self, schema: dict, prefix: bytes, t: int) -> bool:
         if t in self.eos:
-            return judge(schema, prefix) == "complete"
+            return judge(schema, prefix, self.ws) == "complete"
         piece = self.pieces[t]
-        return piece is not None and judge(schema, prefix + piece) != "bad"
+        return piece is not None and judge(schema, prefix + piece, self.ws) != "bad"
 
     def path(self, schema, gid, compiled, rows, tokens, steps) -> None:
         """One path, both masks compared and judged before each token: ``tokens`` given, or
@@ -148,6 +169,7 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--model", required=True)
     p.add_argument("--schemas", required=True)
+    p.add_argument("--ws", type=int, default=0, help="whitespace bytes allowed per gap")
     p.add_argument("--docs", type=int, default=40)
     p.add_argument("--walks", type=int, default=40)
     p.add_argument("--walk-steps", type=int, default=600)
@@ -162,21 +184,32 @@ def main() -> int:
     pieces = token_bytes(tok, vocab)
     eos = eos_ids(tok, args.model)
     t0 = time.perf_counter()
-    store = Store(pieces, eos, vocab, 0)
+    store = Store(pieces, eos, vocab, args.ws)
     store_s = time.perf_counter() - t0
     info = xgr.TokenizerInfo.from_huggingface(tok, vocab_size=vocab, stop_token_ids=eos)
     compiler = xgr.GrammarCompiler(info)
     bitmask = xgr.allocate_token_bitmask(1, vocab)
     check = Checker(
-        store, pieces, vocab, eos, bitmask, rng, args.judge_every, args.sample, args.diff_cap
+        store,
+        pieces,
+        vocab,
+        eos,
+        args.ws,
+        bitmask,
+        rng,
+        args.judge_every,
+        args.sample,
+        args.diff_cap,
     )
-    report = {"vocab": vocab, "eos": eos, "store_build_s": store_s, "schemas": {}}
+    if args.ws:
+        spacing = {"any_whitespace": True, "max_whitespace_cnt": args.ws}
+    else:
+        spacing = {"any_whitespace": False, "separators": (",", ":")}
+    report = {"vocab": vocab, "eos": eos, "ws": args.ws, "store_build_s": store_s, "schemas": {}}
     for path in sorted(Path(args.schemas).glob("*.json")):
         schema = json.loads(path.read_text(encoding="utf-8"))
         gid = store.compile(json.dumps(schema))
-        compiled = compiler.compile_json_schema(
-            json.dumps(schema), any_whitespace=False, separators=(",", ":")
-        )
+        compiled = compiler.compile_json_schema(json.dumps(schema), **spacing)
         rows = {
             "paths": 0,
             "steps": 0,
@@ -190,7 +223,7 @@ def main() -> int:
             "xgrammar_examples": [],
         }
         for _ in range(args.docs):
-            doc = json.dumps(instance(schema, rng), ensure_ascii=False, separators=(",", ":"))
+            doc = spaced(instance(schema, rng), rng, args.ws)
             ids = tok(doc, add_special_tokens=False)["input_ids"] + [eos[0]]
             check.path(schema, gid, compiled, rows, ids, len(ids) + 1)
         for _ in range(args.walks):
