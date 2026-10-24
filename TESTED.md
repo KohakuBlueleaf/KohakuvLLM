@@ -8,10 +8,9 @@ holds the vLLM version of the newest row, and the plugin warns when the installe
 |---|---|---|---|---|
 | `kohakuvllm.sched.PhasedScheduler` | 0.32.0 (PyPI wheel) | 2.13.0+cu130 | RTX 5090 (sm120), RTX 3090 (sm86) | 2026-10-24 |
 | `kohakuvllm.gdn.hybrid`, `kohakuvllm.gdn.conv` | 0.32.0 (PyPI wheel) | 2.13.0+cu130 | RTX 5090 (sm120) | 2026-10-24 |
-| `kohakuvllm.gdn.state8` | 0.32.0 (PyPI wheel) | 2.13.0+cu130 | RTX 5090 (sm120: FP8 and INT8 in the engine), RTX 3090 (sm86: INT8 in the engine), RTX 2080 Ti (sm75: INT8 in the engine) | 2026-10-24 |
+| `kohakuvllm.gdn.state8` | 0.32.0 (PyPI wheel) | 2.13.0+cu130 | RTX 5090 (sm120: FP8 and INT8 in the engine), RTX 3090 (sm86: INT8 in the engine) | 2026-10-24 |
 | `kohakuvllm.front` | 0.32.0 (PyPI wheel) | 2.13.0+cu130 | RTX 5090 (sm120) | 2026-10-24 |
 | `kohakuvllm.grammar` (Model Runner V2), `kohakuvllm-grammar` 0.0.1 | 0.32.0 (PyPI wheel) | 2.13.0+cu130 | RTX 5090 (sm120), RTX 3090 (sm86); in-process and behind `vllm serve` | 2026-10-24 |
-| `kohakuvllm.gdn.state8` on Volta | 0.32.0 (source build, sm70) | 2.13.0+cu126 | V100 (sm70: INT8 in the engine) | 2026-10-24 |
 | `kohakuvllm.plugin` | 0.32.0 (PyPI wheel) | 2.13.0+cu130 | RTX 5090 (sm120), RTX 3090 (sm86) | 2026-10-24 |
 | `tools/quantize.py`, `tools/smooth.py` | 0.32.0 (PyPI wheel) | 2.13.0+cu130 | RTX 5090 (FP8), RTX 3090 (INT8) | 2026-10-24 |
-| `bench/` | 0.32.0 (PyPI wheel) | 2.13.0+cu130 | RTX 5090 (sm120), RTX 3090 (sm86), RTX 2080 Ti (sm75) | 2026-10-24 |
+| `bench/` | 0.32.0 (PyPI wheel) | 2.13.0+cu130 | RTX 5090 (sm120), RTX 3090 (sm86) | 2026-10-24 |

@@ -1,7 +1,6 @@
 # Frontend, 8-bit GDN state and grammar (2026-10-24)
 
-vLLM 0.32.0 (Model Runner V2), torch 2.13 cu130; the V100 runs vLLM 0.32.0 built from source for
-sm70 on torch 2.13 cu126. Qwen3.5-4B: the FP8 checkpoint with FP8 GDN projections on the 5090,
+vLLM 0.32.0 (Model Runner V2), torch 2.13 cu130. Qwen3.5-4B: the FP8 checkpoint with FP8 GDN projections on the 5090,
 SmoothQuant INT8 (`sq65all`) on the 3090. The machine is KohakuGBC's
 `configs/machine/qwen35_card.py` with the `mid` + `sam3` controls, 480 images per card, the VLM
 in-process with the PhasedScheduler (prefill every 16 steps), KV cache fixed at 12 GiB (5090) /
@@ -49,8 +48,6 @@ replayed, 8x1 tile, relative to the bf16 pool:
 | Card | batch 128 | batch 256-384 |
 |---|---|---|
 | RTX 5090 | INT8 2.4x, FP8 2.4x | 1.9x both |
-| RTX 2080 Ti | INT8 1.6x | 1.8-1.9x |
-| V100 | INT8 1.3x | 1.5x |
 
 Engine precision (5090, 431 recorded conversations, against the bf16 state):
 
@@ -69,8 +66,7 @@ INT8 sits at the floor; FP8 a little below it. In the machine:
 | RTX 3090 (each cell on every card) | 0.576 | 0.630 (+6 to +14% per card) | 160k -> 177k |
 
 The 5090 is power-bound (96-98% busy at 545-560 W of 575), so the larger cache does not turn
-into throughput there. Engine alone, 1000 in / 100 out: 2080 Ti 3.35 -> 3.52 req/s (INT8); V100
-2.65 -> 2.58 and 1.91 -> 1.86 on two cards (prefill dominates there and pays the quantize).
+into throughput there.
 
 ## Grammar (`kohakuvllm.grammar`)
 

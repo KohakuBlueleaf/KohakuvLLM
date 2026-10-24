@@ -27,8 +27,8 @@ FORMATS = {"fp8": (torch.float8_e4m3fn, 448.0), "int8": (torch.int8, 127.0)}
 SCALE_BYTES = 4
 _ORIGINAL = {}
 _FORMAT = {"name": "fp8"}
-# The decode kernel's state rows and warps per program (install's ``tile``). 8x1 measured best of
-# 8..64 rows x 1..4 warps on a 2080 Ti (int8 1.6-1.9x bf16; 32x1: 0.8x) and level on a 5090 (1.9x)
+# The decode kernel's state rows and warps per program (install's ``tile``); 8x1 and the larger
+# tiles are level on a 5090 (1.9x the bf16 pool)
 TILE = {"rows": 8, "warps": 1}
 
 
