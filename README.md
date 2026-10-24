@@ -4,7 +4,8 @@ Faster serving of small hybrid VLMs (Qwen3.5: Gated DeltaNet + full attention, w
 tower) on [vLLM](https://github.com/vllm-project/vllm): our own scheduler, JSON grammar, 8-bit
 GDN state and quantizer, as a plugin package beside a stock vLLM wheel. Nothing is forked,
 patched on disk or recompiled; with no option set, vLLM runs as shipped. [TESTED.md](TESTED.md)
-names the vLLM versions each part was verified on.
+names the vLLM versions each part was verified on. To use it, follow the
+[tutorial](#tutorial-serve-qwen35-4b-with-everything-on).
 
 ## Speed
 
@@ -79,34 +80,118 @@ Allow whitespace (`KOHAKU_GRAMMAR_WS`, default 8 bytes per gap): forced into com
 Qwen3.5 runs 5-10% of some replies to `max_tokens`, with xgrammar as with ours. With whitespace
 allowed, none.
 
-## Install and serve
+## Tutorial: serve Qwen3.5-4B with everything on
+
+### 1. Install
+
+KohakuvLLM is installed from this repository (it is not on PyPI), into the environment that
+already has vLLM (`pip install vllm`, see [TESTED.md](TESTED.md) for the version).
 
 ```bash
-pip install kohakuvllm            # beside vLLM; or pip install -e . from a clone
-pip install ./grammar             # the Rust grammar matcher (needs maturin and a Rust toolchain)
+git clone https://github.com/KohakuBlueleaf/KohakuvLLM
+cd KohakuvLLM
+pip install -e .                  # the plugin: scheduler, GDN state, frontend, tools
+pip install maturin
+pip install ./grammar             # the Rust grammar matcher (needs a Rust toolchain: rustup.rs)
 ```
+
+Check both halves: `python -c "import kohakuvllm, kohakuvllm_grammar"`.
+
+### 2. Make the FP8-GDN checkpoint (optional, +11%)
+
+Start from the FP8 checkpoint and quantize the GDN projections it leaves in BF16:
+
+```bash
+huggingface-cli download RedHatAI/Qwen3.5-4B-FP8-dynamic --local-dir qwen35-4b-fp8
+python tools/quantize.py qwen35-4b-fp8 qwen35-4b-fp8-gdn --scheme fp8 \
+    --suffixes linear_attn.in_proj_qkv.weight linear_attn.in_proj_z.weight \
+    linear_attn.out_proj.weight
+```
+
+`qwen35-4b-fp8-gdn` is a normal compressed-tensors checkpoint; any vLLM loads it. Skip this step
+to serve `qwen35-4b-fp8` (or the BF16 `Qwen/Qwen3.5-4B`) instead.
+
+### 3. Serve
 
 ```bash
 KOHAKU_GDN_STATE=int8 KOHAKU_PREFILL_EVERY=16 VLLM_HTTP_TIMEOUT_KEEP_ALIVE=60 \
-vllm serve Qwen/Qwen3.5-4B \
+vllm serve qwen35-4b-fp8-gdn --served-model-name qwen3.5-4b \
+    --gpu-memory-utilization 0.90 --max-num-seqs 384 --max-model-len 8192 \
+    --limit-mm-per-prompt '{"image": 1}' \
     --mamba-ssm-cache-dtype bfloat16 \
     --scheduler-cls kohakuvllm.sched.PhasedScheduler \
     --logits-processors kohakuvllm.grammar:JsonSchemaLogits
 ```
 
-A request asks for its JSON schema in `vllm_xargs`:
+Each line is one part; drop any of them to turn it off:
 
-```json
-{"model": "...", "messages": [...], "vllm_xargs": {"kohaku_json_schema": "{\"type\": \"object\", ...}"}}
+| Option | Part |
+|---|---|
+| `KOHAKU_GDN_STATE=int8` | the 8-bit GDN state (`fp8` on sm89+) |
+| `--scheduler-cls ... KOHAKU_PREFILL_EVERY=16` | `PhasedScheduler` |
+| `--logits-processors ...` | the JSON grammar |
+| `--mamba-ssm-cache-dtype bfloat16` | vLLM's own bf16 GDN state (the x2.1 step) |
+| `VLLM_HTTP_TIMEOUT_KEEP_ALIVE=60` | no dropped requests when the API server stalls |
+
+The keep-alive: when vLLM's API server stalls (up to 2.6 s at full load), uvicorn's 5 s
+keep-alive closes connections a request was just sent on, and that request gets no response
+(4 of 5172 requests at 5 s, 0 at 300 s). A client can also expire its idle connections sooner,
+e.g. `httpx.Limits(keepalive_expiry=2)` (0 of 5172).
+
+### 4. Ask for JSON
+
+The schema goes in `vllm_xargs` as text (not in `response_format`, which is xgrammar's):
+
+```python
+import base64, json
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="none")
+schema = {
+    "type": "object",
+    "properties": {
+        "caption": {"type": "string", "minLength": 1, "maxLength": 400},
+        "objects": {"type": "array", "maxItems": 8, "items": {"type": "string"}},
+    },
+    "required": ["caption", "objects"],
+}
+image = base64.b64encode(open("cat.jpg", "rb").read()).decode()
+reply = client.chat.completions.create(
+    model="qwen3.5-4b",
+    messages=[{"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image}"}},
+        {"type": "text", "text": "Describe the image as JSON."},
+    ]}],
+    max_tokens=512,
+    extra_body={
+        "vllm_xargs": {"kohaku_json_schema": json.dumps(schema)},
+        "chat_template_kwargs": {"enable_thinking": False},
+    },
+)
+print(json.loads(reply.choices[0].message.content))
 ```
 
-In-process (`AsyncLLM`), the same parts are engine arguments (`scheduler_cls=`,
-`logits_processors=`) and `SamplingParams(extra_args={"kohaku_json_schema": ...})`.
+Supported schema keywords: `object` (`properties`, `required`; keys in schema order), `array`
+(`items`, `minItems`, `maxItems`), `string` (`minLength`, `maxLength`), `integer`, `number`,
+`boolean`, `null`, `enum`, `const`. Any other type is rejected with an error; other keywords
+(`pattern`, `format`, ...) are not enforced.
 
-`VLLM_HTTP_TIMEOUT_KEEP_ALIVE` above uvicorn's 5 s: when the API server stalls, an expired
-keep-alive closes a connection a request was just sent on, and that request gets no response
-(4 of 5172 at 5 s; 0 at 300 s). Or let the client expire idle connections sooner, e.g.
-`httpx.Limits(keepalive_expiry=2)` (0 of 5172).
+### 5. Or in-process
+
+```python
+import json
+from vllm import LLM, SamplingParams
+
+llm = LLM(
+    "qwen35-4b-fp8-gdn",
+    mamba_ssm_cache_dtype="bfloat16",
+    scheduler_cls="kohakuvllm.sched.PhasedScheduler",
+    logits_processors=["kohakuvllm.grammar:JsonSchemaLogits"],
+)
+params = SamplingParams(max_tokens=512, extra_args={"kohaku_json_schema": json.dumps(schema)})
+```
+
+`KOHAKU_GDN_STATE` and `KOHAKU_PREFILL_EVERY` are read from the environment, as above.
 
 ## The parts
 
