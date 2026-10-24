@@ -5,11 +5,11 @@ For each schema, the compact JSON grammar (no whitespace; xgrammar with ``any_wh
 separators ``,`` ``:``) is walked along two kinds of paths: documents generated to the schema
 (strings at and near their limits, escapes, multi-byte characters, arrays at their item limits),
 tokenized; and random walks that pick each next token uniformly from our mask. At every step
-both masks are compared over the whole vocabulary. The judge decides every token the two masks
-disagree on, end-of-sequence, and (every ``--judge-every`` steps) a random sample of the
-vocabulary, so each side's errors are counted against the JSON and schema rules themselves;
-examples are kept (no threshold). Then CPU time per mask: ours (memoised; the first build of
-each counted apart) and xgrammar's fill.
+both masks are compared over the whole vocabulary. The judge decides the tokens the two masks
+disagree on (all of them, or a random ``--diff-cap`` of them), end-of-sequence, and (every
+``--judge-every`` steps) a random sample of the vocabulary, so each side's errors are counted
+against the JSON and schema rules themselves; examples are kept (no threshold). Then CPU time per
+mask: ours (memoised; the first build of each counted apart) and xgrammar's fill.
 
     python bench/grammar/check.py --model DIR --schemas DIR [--docs 40] [--walks 40] [--out r.json]
 """
@@ -72,10 +72,10 @@ def unpack(words: np.ndarray, vocab: int) -> np.ndarray:
 
 
 class Checker:
-    def __init__(self, store, pieces, vocab, eos, bitmask, rng, judge_every, sample):
+    def __init__(self, store, pieces, vocab, eos, bitmask, rng, judge_every, sample, diff_cap):
         self.store, self.pieces, self.vocab, self.eos = store, pieces, vocab, eos
         self.bitmask, self.rng = bitmask, rng
-        self.judge_every, self.sample = judge_every, sample
+        self.judge_every, self.sample, self.diff_cap = judge_every, sample, diff_cap
         self.ours_s = self.xgr_s = 0.0
 
     def allowed(self, schema: dict, prefix: bytes, t: int) -> bool:
@@ -103,6 +103,8 @@ class Checker:
             rows["steps"] += 1
             differ = np.flatnonzero(ours != theirs).tolist()
             rows["agree"] += not differ
+            if len(differ) > self.diff_cap:
+                differ = self.rng.sample(differ, self.diff_cap)
             judged = set(differ) | set(self.eos)
             if rows["steps"] % self.judge_every == 0:
                 judged |= set(self.rng.sample(range(self.vocab), self.sample))
@@ -151,6 +153,7 @@ def main() -> int:
     p.add_argument("--walk-steps", type=int, default=600)
     p.add_argument("--judge-every", type=int, default=25)
     p.add_argument("--sample", type=int, default=2000)
+    p.add_argument("--diff-cap", type=int, default=200, help="disagreeing tokens judged per step")
     p.add_argument("--out", default=None)
     args = p.parse_args()
     rng = random.Random(0)
@@ -164,7 +167,9 @@ def main() -> int:
     info = xgr.TokenizerInfo.from_huggingface(tok, vocab_size=vocab, stop_token_ids=eos)
     compiler = xgr.GrammarCompiler(info)
     bitmask = xgr.allocate_token_bitmask(1, vocab)
-    check = Checker(store, pieces, vocab, eos, bitmask, rng, args.judge_every, args.sample)
+    check = Checker(
+        store, pieces, vocab, eos, bitmask, rng, args.judge_every, args.sample, args.diff_cap
+    )
     report = {"vocab": vocab, "eos": eos, "store_build_s": store_s, "schemas": {}}
     for path in sorted(Path(args.schemas).glob("*.json")):
         schema = json.loads(path.read_text(encoding="utf-8"))

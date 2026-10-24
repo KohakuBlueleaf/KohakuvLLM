@@ -31,15 +31,19 @@ Every change, where it hooks in, and how it is turned on. Nothing else in vLLM i
 | `kohakuvllm.front` | vLLM's `enable_mm_embeds` input path: requests go in as token ids plus `image_embeds` / `image_grid_thw` | KohakuGBC's in-process entry (`frontend="kohakuvllm"`), or `Frontend(llm, model)` around any `AsyncLLM` | the input side outside vLLM's engine: chat template and image processor in a pool of worker processes (`prep`), and the model's own vision tower (bf16, or FP8 linears on sm89+) batched on its own CUDA stream in the caller's process (`vision`); the engine then only decodes |
 | `kohakuvllm.grammar` (with the `kohakuvllm-grammar` package, `grammar/`) | a vLLM v1 logits processor, loaded by vLLM's `logits_processors` engine argument; per request through `SamplingParams.extra_args` (`vllm_xargs` over HTTP) | `--logits-processors kohakuvllm.grammar:JsonSchemaLogits` and `extra_args={"kohaku_json_schema": SCHEMA}`; `KOHAKU_GRAMMAR_WS` (whitespace per gap, 0) | JSON-schema replies: a Rust byte-level matcher (object, array, string with lengths, number, boolean, null, enum) whose counters clamp to the longest token, so each distinct clamped state's mask is built once (a token-trie walk; string bodies from precomputed masks) and copied once to a GPU table. A step costs one Rust call for the batch and one mask id per row; one Triton kernel masks the logits |
 
-Measured (RTX 5090, vLLM 0.32.0; [reports](reports/)):
+Measured (vLLM 0.32.0; RTX 5090 unless named; [reports](reports/)). GBC's flagship machine, one
+per card on four 5090s with `PhasedScheduler`, `grammar` and the INT8 `gdn.state8`: 6.46 img/s
+for the box (1.59-1.65 per card), 17% over stock vLLM on the same machine, in-process and behind
+`vllm serve` alike.
 
 | Part | Result |
 |---|---|
 | `PhasedScheduler` | GBC's flagship machine on one card: 0.95 -> 1.36 img/s at vLLM share 0.55, 1.50-1.55 at 0.75 with 384 lanes (prefill every 16 steps; 4 / 8 / 32 within 3%). Under a saturated offline queue of uniform prompts it costs (17.8 -> 14.8 requests/s): prefill batches best there |
 | `gdn.conv` | states bitwise equal to vLLM's `causal_conv1d_fn`; 0.06-0.08 ms vs 0.4-1.1 ms per call |
 | `gdn.hybrid` | within the fp32 reference's error of vLLM's split path, capture/replay bitwise, 0.18-0.58 ms vs 0.43-0.93 ms per layer; no gain in the machine (the card is power-bound and the large mixed steps run piecewise either way), so it stays off by default |
-| `gdn.state8` (kernel, 64 decode steps vs an fp64 ruler) | state error per row (mean relative where the ruler is above its mean): bf16 pool 0.17%, INT8 0.64%, FP8 2.7%; outputs 0.17% / 0.36% / 1.25%; no growth over steps; other slots untouched. Decode step at batch 256-384: 1.9x the bf16 pool on a 5090 (INT8 and FP8 alike), 1.6-1.9x on a 2080 Ti (INT8, 8x1 tile) |
-| `grammar` (vs xgrammar 0.1.x on GBC's schemas, every step over the whole vocabulary, disagreements decided by an independent judge, `bench/grammar/`) | ours 0 wrong decisions; xgrammar forbids escapes and allows raw control bytes inside `maxLength` strings. 0.14 ms per new mask, 0.011 ms per step from the memo vs 0.61 ms per xgrammar fill |
+| `gdn.state8` (kernel, 64 decode steps vs an fp64 ruler) | state error per row (mean relative where the ruler is above its mean): bf16 pool 0.17%, INT8 0.64%, FP8 2.7%; outputs 0.17% / 0.36% / 1.25%; no growth over steps; other slots untouched. Decode step at batch 256-384: 1.9x the bf16 pool on a 5090 (INT8 and FP8 alike), 1.6-1.9x on a 2080 Ti (INT8, 8x1 tile). Engine: INT8 teacher-forced KL and greedy agreement at the batching floor, FP8 slightly below. Machine: the same cache holds 11% more KV tokens; KV-bound RTX 3090s +9.4% (+6 to +14% per card, every card), the power-bound 5090 +2% |
+| `front` | prompt ids identical to vLLM's input path; bf16 tower as close to a float32 tower as the reference model's; in the machine 1.21 img/s vs 1.44-1.46 (host-bound preparing, eager tower), so it stays a knob |
+| `grammar` (vs xgrammar 0.1.x on GBC's schemas, every step over the whole vocabulary, disagreements decided by an independent judge, `bench/grammar/`) | ours 0 wrong decisions; xgrammar forbids escapes and allows raw control bytes inside `maxLength` strings. 0.14 ms per new mask, 0.011 ms per step from the memo vs 0.61 ms per xgrammar fill. In the engine 231 / 231 replies valid. Machine: 1.589 img/s vs prompt + retry 1.539, vLLM structured outputs with guidance 1.426 and xgrammar 1.226 (the scheduler-side bitmask defers requests under async scheduling) |
 
 ## Tools and benchmarks
 
