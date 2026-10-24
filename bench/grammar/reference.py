@@ -127,6 +127,9 @@ class Judge:
                 return i + 1
             if b < 0x20:
                 raise Bad
+            # A character that starts past maxLength fails even if the data ends inside it
+            if hi is not None and n + 1 > hi:
+                raise Bad
             if b == ord("\\"):
                 e = self.peek(i + 1)
                 if e in b'"\\/bfnrt':
@@ -153,8 +156,6 @@ class Judge:
                     if self.peek(i + k) & 0xC0 != 0x80:
                         raise Bad
             n += 1
-            if hi is not None and n > hi:
-                raise Bad
             i += size
 
     def number(self, i: int, integer: bool) -> int:

@@ -76,10 +76,10 @@ into throughput there. Engine alone, 1000 in / 100 out: 2080 Ti 3.35 -> 3.52 req
 
 Masks, every step over the whole vocabulary of generated documents and random walks on GBC's
 seven schemas, compared with xgrammar's; every disagreement and a sample of the agreements
-decided by `bench/grammar/reference.py`: ours 0 wrong of 841k judged on the first schema run;
-xgrammar forbids escapes and allows raw control bytes inside `maxLength` strings, and rejected
-valid documents. CPU: 0.14 ms per new mask, 0.011 ms per step from the memo; xgrammar 0.61 ms per
-fill. In the engine: 231 of 231 replies (32 sampled at temperature 1.0 + 1 greedy per schema)
+decided by `bench/grammar/reference.py`. All seven schemas, 20 documents and 20 walks each:
+39,549 steps, 7.35M judged decisions, ours 0 wrong; xgrammar 5.7M wrong (it forbids escapes and
+allows raw control bytes inside `maxLength` strings) and rejected 163 valid documents. CPU: 0.07-
+0.10 ms per new mask, 0.005 ms per step from the memo; xgrammar 0.6-0.75 ms per fill. In the engine: 231 of 231 replies (32 sampled at temperature 1.0 + 1 greedy per schema)
 are complete valid documents.
 
 The machine, 5090, four cells in one window:
