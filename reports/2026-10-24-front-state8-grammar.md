@@ -66,7 +66,7 @@ INT8 sits at the floor; FP8 a little below it. In the machine:
 | Card | bf16 state | INT8 state | KV tokens in the same cache |
 |---|---|---|---|
 | RTX 5090 (clean window) | 1.560 | 1.591 | 320k -> 355k |
-| RTX 3090 | see the 3090 table | | 160k -> 177k |
+| RTX 3090 (each cell on every card) | 0.576 | 0.630 (+6 to +14% per card) | 160k -> 177k |
 
 The 5090 is power-bound (96-98% busy at 545-560 W of 575), so the larger cache does not turn
 into throughput there. Engine alone, 1000 in / 100 out: 2080 Ti 3.35 -> 3.52 req/s (INT8); V100
