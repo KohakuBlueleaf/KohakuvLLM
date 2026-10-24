@@ -1,74 +1,223 @@
 # KohakuvLLM
 
-Our own frontend and kernels for running small hybrid VLMs (Qwen3.5: Gated DeltaNet + full
-attention, with a vision tower) at full GPU load, with [vLLM](https://github.com/vllm-project/vllm)'s
-engine as the backend. It is a drop-in plugin package: install it beside a stock vLLM wheel;
-nothing is forked, patched on disk or recompiled. It follows upstream vLLM;
-[TESTED.md](TESTED.md) names the last versions each part was verified on, and the plugin warns
-when the installed vLLM is newer.
+Our own scheduler, grammar and kernels for running small hybrid VLMs (Qwen3.5: Gated DeltaNet +
+full attention, with a vision tower) at full GPU load, with
+[vLLM](https://github.com/vllm-project/vllm)'s engine as the backend.
+
+It is a drop-in plugin package: install it beside a stock vLLM wheel. Nothing is forked, patched
+on disk or recompiled, and with no option set vLLM runs as shipped. It follows upstream vLLM;
+[TESTED.md](TESTED.md) names the last versions each part was verified on.
+
+## At a glance
+
+**12.7 -> 23.2 requests/s (1.8x)** on one RTX 5090: Qwen3.5-4B behind `vllm serve` with real
+captioning requests (an image and a JSON schema each), vLLM's defaults against KohakuvLLM's
+configuration. The 12.7 had the card to itself; the 23.2 shares it with SAM 3 and
+EmbeddingGemma.
+
+With every vLLM setting the same on both sides: one RTX 5090, Qwen3.5-4B (8-bit weights),
+[KohakuGBC](https://github.com/KohakuBlueleaf/KohakuGBC)'s captioning machine (VLM + SAM 3 +
+EmbeddingGemma on the card), real captioning requests:
+
+| | stock vLLM | with KohakuvLLM |
+|---|---|---|
+| VLM requests/s, behind `vllm serve` | **19.8** | **23.2** (+17%) |
+| images/s, behind `vllm serve` | 1.445 | **1.695** |
+| images/s, engine in-process | 1.418 | **1.653** |
+
+Same machine settings for both columns (0.75 of the card, 384 sequences, the same checkpoint),
+one window, each cell on its own card; stock vLLM gets its JSON by prompt and one retry. Four cards, one machine each: **6.46 images/s** for the
+box.
+
+From the first measurement to the final configuration, step by step:
+
+| Step | img/s per card | Change |
+|---|---|---|
+| stock vLLM, 0.55 of the card | 0.95 | |
+| + `PhasedScheduler` | 1.36 | **+43%** |
+| + 0.75 of the card, 384 sequences | 1.50-1.55 | +12% (vLLM settings) |
+| + Rust JSON grammar (vs xgrammar) | 1.589 (vs 1.226) | **+30%** |
+| + 8-bit GDN state | 1.59-1.65 | +2% (5090), +9% (3090) |
+
+The engine alone, synthetic 1000 tokens in / 100 out, in-process:
+
+| Step | requests/s |
+|---|---|
+| stock vLLM, `RedHatAI/Qwen3.5-4B-FP8-dynamic` | 17.8 |
+| + GDN projections in FP8 (`tools/quantize.py`) | +19% |
+| + bf16 GDN state (vLLM's `mamba_ssm_cache_dtype`) | +27% |
+| **= together** | **26.9** (1.5x) |
+
+```mermaid
+xychart-beta
+    title "JSON replies, one RTX 5090 (images/s per card)"
+    x-axis ["vLLM + xgrammar", "vLLM + guidance", "prompt + retry", "KohakuvLLM grammar"]
+    y-axis "images/s" 0 --> 1.8
+    bar [1.226, 1.426, 1.539, 1.589]
+```
+
+## Where the time goes
+
+With vLLM's defaults behind `vllm serve` and a JSON schema per request (12.7 requests/s on this
+card), the GPU waits on the engine's host thread. KohakuvLLM moves that work off the thread and
+keeps the steps graph-replayed until the GPU itself, at its power cap, is the limit.
+
+```mermaid
+flowchart LR
+    subgraph stock["vLLM defaults: GPU 35-55% busy"]
+        direction TB
+        A1["API server<br/>tokenize, image preprocess"] --> B1["scheduler<br/>builds the grammar bitmask,<br/>waits for each last token"]:::slow
+        B1 --> C1["engine step<br/>mixed prefill + decode,<br/>GDN layers run eagerly"]:::slow
+        C1 --> D1["GPU<br/>idle between steps"]
+    end
+    subgraph ours["KohakuvLLM: GPU 96% busy"]
+        direction TB
+        A2["API server"] --> B2["PhasedScheduler<br/>decode-only steps between prefills"]:::fast
+        B2 --> C2["engine step<br/>full CUDA graph replay;<br/>grammar: one mask id per row"]:::fast
+        C2 --> D2["GPU<br/>575 W power cap"]:::limit
+    end
+    classDef slow fill:#f8d0d0,stroke:#b03030,color:#000
+    classDef fast fill:#d0ecd0,stroke:#308030,color:#000
+    classDef limit fill:#fff0c0,stroke:#a08000,color:#000
+```
+
+- **Stock bottleneck 1, mixed steps.** A step that holds both prefill and decode runs piecewise:
+  the GDN layers launch about 460 kernels per step eagerly, and the GPU waits for the host.
+- **Stock bottleneck 2, the grammar bitmask.** vLLM builds it in the scheduler, which has to
+  wait for each request's last token. Under async scheduling about 250 requests stay "Deferred"
+  and the card idles (74.8% busy with xgrammar).
+- **Tuned stock vLLM keeps the card busy, on slower work.** With the share and sequences raised,
+  stock vLLM also fills the GPU (98.8% busy), but its mixed steps send decode attention down the
+  split-KV path: 12.0% of GPU time, against 3.1% when `PhasedScheduler` keeps decodes in their
+  own steps, the largest difference between the two profiles.
+- **KohakuvLLM's limit is the card.** At 96% busy and 545-575 W, the GPU time is FP8 GEMMs
+  (about half), attention (14%) and the GDN decode; SAM 3 and EmbeddingGemma share the card.
+
+## Install
 
 ```bash
 pip install kohakuvllm            # beside vLLM; or pip install -e . from a clone
-pip install ./grammar             # the Rust grammar matcher (maturin, a Rust toolchain)
-vllm serve Qwen/... --scheduler-cls kohakuvllm.sched.PhasedScheduler
+pip install ./grammar             # the Rust grammar matcher (needs maturin and a Rust toolchain)
 ```
 
-The same parts apply to vLLM's engine driven in-process (`AsyncLLM`, as KohakuGBC's in-process
-VLM entry does) and behind `vllm serve`: every part is opted into by an engine argument or an
-environment variable, and with none set vLLM runs as shipped.
+Serve with the scheduler, the grammar and the 8-bit GDN state:
 
-## What it changes in vLLM
+```bash
+KOHAKU_GDN_STATE=int8 KOHAKU_PREFILL_EVERY=16 vllm serve Qwen/Qwen3.5-4B \
+    --scheduler-cls kohakuvllm.sched.PhasedScheduler \
+    --logits-processors kohakuvllm.grammar:JsonSchemaLogits
+```
 
-Every change, where it hooks in, and how it is turned on. Nothing else in vLLM is touched.
+A request then asks for its JSON schema in `vllm_xargs`:
 
-| Part | Hooks into vLLM | On by | What it does |
-|---|---|---|---|
-| `kohakuvllm.plugin` | the `vllm.general_plugins` entry point (runs at import in every vLLM process) | installing the package | warns once when vLLM is newer than `TESTED_VLLM`; installs `gdn.hybrid` when `KOHAKU_GDN` asks for it and `gdn.state8` when `KOHAKU_GDN_STATE` does; nothing else |
-| `kohakuvllm.sched.PhasedScheduler` | a subclass of `vllm.v1.core.sched.async_scheduler.AsyncScheduler`, loaded by vLLM's `scheduler_cls` engine argument | `--scheduler-cls kohakuvllm.sched.PhasedScheduler` (`scheduler_cls=` in-process) | keeps prefill out of most steps: between prefill steps it calls vLLM's own prefill throttle with the saturation escape off, so those steps are uniform decode batches that replay full CUDA graphs. `KOHAKU_PREFILL_EVERY` (4): one step in that many admits prefill; 1 is vLLM's own scheduling |
-| `kohakuvllm.gdn.hybrid` | replaces `QwenGatedDeltaNetAttention._forward_core` and `GDNAttentionBackend.get_builder_cls` (a subclass of vLLM's GDN metadata builder), and takes `vllm::qwen_gdn_attention_core` out of `CompilationConfig`'s splitting ops | `KOHAKU_GDN=hybrid`; `KOHAKU_GDN=check` runs it beside vLLM's core and logs the difference per layer and step (`KOHAKU_GDN_CHECK`: the log path prefix) | the GDN core of mixed prefill/decode steps as one fixed launch sequence over persistent padded buffers, so piecewise CUDA graphs capture it: `gdn.conv`'s varlen causal conv and state update, vLLM's `fused_post_conv_prep`, FLA's recurrent kernel for decodes and FlashInfer's chunked kernel for prefills, both on the state pool by slot. Decode-only steps keep vLLM's path; speculative decoding keeps vLLM's path |
-| `kohakuvllm.gdn.conv` | none (kernels called by `gdn.hybrid`) | with `gdn.hybrid` | the causal conv over a packed varlen batch and each sequence's conv-state update, in Triton, for both of vLLM's conv-state layouts |
-| `kohakuvllm.gdn.state8` | `MambaStateShapeCalculator.gated_delta_net_state_shape` / `MambaStateDtypeCalculator.gated_delta_net_state_dtype` (the pool becomes `uint8 [HV, V, K + 4]`), the GDN module's `fused_recurrent_gated_delta_rule_packed_decode` and `fused_sigmoid_gating_delta_rule_update`, and `QwenGatedDeltaNetAttention.__init__` (its chunked prefill wrapped) | `KOHAKU_GDN_STATE=int8` or `fp8` (FP8: sm89+); `KOHAKU_GDN_STATE_TILE=ROWSxWARPS` | the GDN recurrent state in 8 bits with a float32 scale per row: half the state bytes. Decodes run one Triton kernel that dequantizes, steps and requantizes each row; prefills dequantize the gathered states before vLLM's chunked kernel and quantize its final states. Not with `gdn.hybrid` or speculative decoding |
-| `kohakuvllm.front` | vLLM's `enable_mm_embeds` input path: requests go in as token ids plus `image_embeds` / `image_grid_thw` | KohakuGBC's in-process entry (`frontend="kohakuvllm"`), or `Frontend(llm, model)` around any `AsyncLLM` | the input side outside vLLM's engine: chat template and image processor in a pool of worker processes (`prep`), and the model's own vision tower (bf16, or FP8 linears on sm89+) batched on its own CUDA stream in the caller's process (`vision`); the engine then only decodes |
-| `kohakuvllm.grammar` (with the `kohakuvllm-grammar` package, `grammar/`) | a vLLM v1 logits processor, loaded by vLLM's `logits_processors` engine argument; per request through `SamplingParams.extra_args` (`vllm_xargs` over HTTP) | `--logits-processors kohakuvllm.grammar:JsonSchemaLogits` and `extra_args={"kohaku_json_schema": SCHEMA}`; `KOHAKU_GRAMMAR_WS` (whitespace per gap, 0) | JSON-schema replies: a Rust byte-level matcher (object, array, string with lengths, number, boolean, null, enum) whose counters clamp to the longest token, so each distinct clamped state's mask is built once (a token-trie walk; string bodies from precomputed masks) and copied once to a GPU table. A step costs one Rust call for the batch and one mask id per row; one Triton kernel masks the logits |
+```json
+{"model": "...", "messages": [...], "vllm_xargs": {"kohaku_json_schema": "{\"type\": \"object\", ...}"}}
+```
 
-Measured (vLLM 0.32.0; RTX 5090 unless named; [reports](reports/)). GBC's flagship machine, one
-per card on four 5090s with `PhasedScheduler`, `grammar` and the INT8 `gdn.state8`: 6.46 img/s
-for the box (1.59-1.65 per card), 17% over stock vLLM on the same machine, in-process and behind
-`vllm serve` alike.
+In-process (`AsyncLLM`), the same parts are engine arguments (`scheduler_cls=`,
+`logits_processors=`) and `SamplingParams(extra_args={"kohaku_json_schema": ...})`.
 
-| Part | Result |
-|---|---|
-| `PhasedScheduler` | GBC's flagship machine on one card: 0.95 -> 1.36 img/s at vLLM share 0.55, 1.50-1.55 at 0.75 with 384 lanes (prefill every 16 steps; 4 / 8 / 32 within 3%). Under a saturated offline queue of uniform prompts it costs (17.8 -> 14.8 requests/s): prefill batches best there |
-| `gdn.conv` | states bitwise equal to vLLM's `causal_conv1d_fn`; 0.06-0.08 ms vs 0.4-1.1 ms per call |
-| `gdn.hybrid` | within the fp32 reference's error of vLLM's split path, capture/replay bitwise, 0.18-0.58 ms vs 0.43-0.93 ms per layer; no gain in the machine (the card is power-bound and the large mixed steps run piecewise either way), so it stays off by default |
-| `gdn.state8` (kernel, 64 decode steps vs an fp64 ruler) | state error per row (mean relative where the ruler is above its mean): bf16 pool 0.17%, INT8 0.64%, FP8 2.7%; outputs 0.17% / 0.36% / 1.25%; no growth over steps; other slots untouched. Decode step at batch 256-384: 1.9x the bf16 pool on a 5090 (INT8 and FP8 alike). Engine: INT8 teacher-forced KL and greedy agreement at the batching floor, FP8 slightly below. Machine: the same cache holds 11% more KV tokens; KV-bound RTX 3090s +9.4% (+6 to +14% per card, every card), the power-bound 5090 +2% |
-| `front` | prompt ids identical to vLLM's input path; bf16 tower as close to a float32 tower as the reference model's; in the machine 1.21 img/s vs 1.44-1.46 (host-bound preparing, eager tower), so it stays a knob |
-| `grammar` (vs xgrammar 0.1.x on GBC's schemas, every step over the whole vocabulary, disagreements decided by an independent judge, `bench/grammar/`) | all seven schemas, 7.35M judged decisions: ours 0 wrong; xgrammar 5.7M wrong (it forbids escapes and allows raw control bytes inside `maxLength` strings) and rejects 163 valid documents. 0.07-0.10 ms per new mask, 0.005 ms per step from the memo vs 0.6-0.75 ms per xgrammar fill. In the engine 231 / 231 replies valid. Machine: 1.589 img/s vs prompt + retry 1.539, vLLM structured outputs with guidance 1.426 and xgrammar 1.226 (the scheduler-side bitmask defers requests under async scheduling) |
+## The parts
 
-## Tools and benchmarks
+| Part | Turn on | Effect |
+|---|---|---|
+| [`PhasedScheduler`](#phasedscheduler) | `--scheduler-cls` | +43% img/s |
+| [`grammar`](#grammar) | `--logits-processors` | +30% vs xgrammar |
+| [`gdn.state8`](#gdnstate8) | `KOHAKU_GDN_STATE` | +2% (5090), +9% (3090) |
+| [`tools/quantize.py`](#tools) | an FP8 checkpoint | +19% requests/s |
+| [`front`](#front) | in-process only | off: slower here |
+| [`gdn.hybrid`](#gdnhybrid) | `KOHAKU_GDN=hybrid` | off: no gain |
+
+`kohakuvllm.plugin` is the `vllm.general_plugins` entry point. It runs at import in every vLLM
+process, warns once when vLLM is newer than `TESTED_VLLM`, and installs `gdn.state8` or
+`gdn.hybrid` when their variables ask for them. Nothing else in vLLM is touched.
+
+### PhasedScheduler
+
+`kohakuvllm.sched.PhasedScheduler` subclasses vLLM's `AsyncScheduler` (loaded by the
+`scheduler_cls` engine argument). Between prefill steps it calls vLLM's own prefill throttle
+with the saturation escape off, so those steps are uniform decode batches that replay full CUDA
+graphs.
+
+- `KOHAKU_PREFILL_EVERY` (4): one step in that many admits prefill; 1 is vLLM's own scheduling.
+  16 is best on the captioning machine; 4 / 8 / 32 are within 3%.
+- Under a saturated offline queue of uniform prompts it costs (17.8 -> 14.8 requests/s):
+  there, batching prefill wins.
+
+### grammar
+
+`kohakuvllm.grammar:JsonSchemaLogits` is a vLLM v1 logits processor; the matcher is the Rust
+package in `grammar/` (`kohakuvllm-grammar`).
+
+- A byte-level matcher for object, array, string with lengths, number, boolean, null and enum.
+  Its counters clamp to the longest token, so each distinct clamped state's mask is built once
+  (a token-trie walk) and copied once to a GPU table.
+- A step costs one Rust call for the batch and one mask id per row; one Triton kernel masks the
+  logits. The last tokens are read on the worker, so nothing waits in the scheduler.
+- Cost: 0.005 ms per step from the memo, 0.07-0.10 ms per new mask; xgrammar fills a mask in
+  0.6-0.75 ms.
+- Correctness: on GBC's seven schemas, every step over the whole vocabulary was compared with
+  xgrammar, an independent judge deciding each disagreement (7.35M decisions). Ours: 0 wrong.
+  xgrammar: 5.7M wrong (it forbids escapes and allows raw control bytes in `maxLength` strings)
+  and 163 valid documents rejected. In the engine, 231 / 231 replies were valid.
+- `KOHAKU_GRAMMAR_WS`: whitespace allowed per gap (0).
+
+### gdn.state8
+
+The GDN recurrent state in 8 bits with a float32 scale per row: half the state bytes, so the same
+cache holds 11% more KV tokens.
+
+- `KOHAKU_GDN_STATE=int8` or `fp8` (FP8 needs sm89+); `KOHAKU_GDN_STATE_TILE=ROWSxWARPS` (8x1).
+- Decodes run one Triton kernel that dequantizes, steps and requantizes each row; prefills
+  dequantize before vLLM's chunked kernel and quantize its final states.
+- Error against an fp64 ruler over 64 decode steps, per state row: bf16 pool 0.17%, INT8 0.64%,
+  FP8 2.7%; no growth over steps. In the engine INT8 sits at the batching noise floor.
+- Decode step 1.9x the bf16 pool's on a 5090. It pays most where the KV cache is the limit (RTX
+  3090: +9.4% img/s); the power-bound 5090 gains 2%.
+- Not with `gdn.hybrid` or speculative decoding.
+
+### front
+
+`kohakuvllm.front` feeds vLLM's `enable_mm_embeds` path: chat template and image processor in a
+pool of worker processes, and the model's own vision tower (bf16, or FP8 linears on sm89+) on its
+own CUDA stream; the engine then only decodes. Prompt ids are identical to vLLM's path. On the
+captioning machine it is slower (1.21 vs 1.44-1.46 img/s: the host is the limit), so it stays
+off. Used through KohakuGBC's in-process entry or `Frontend(llm, model)` around an `AsyncLLM`.
+
+### gdn.hybrid
+
+`KOHAKU_GDN=hybrid` runs the GDN core of mixed steps as one fixed launch sequence (our Triton
+varlen conv `gdn.conv`, FLA's recurrent decode, FlashInfer's chunked prefill) so piecewise CUDA
+graphs capture it. Each piece is within the fp32 reference's error of vLLM's path and faster per
+layer (0.18-0.58 vs 0.43-0.93 ms), but the machine does not gain: the card is power-bound and the
+large mixed steps run piecewise either way. `KOHAKU_GDN=check` runs it beside vLLM's core and
+logs the difference per layer and step.
+
+## Tools
 
 | Path | What it is |
 |---|---|
-| `tools/quantize.py` | W8A8 checkpoints from a BF16 one: FP8 or INT8 per-channel weights (round to nearest), dynamic per-token activations, over the linears named by suffix or by a reference checkpoint (`--like`), so the GDN projections can go to 8 bits too; vLLM loads them as compressed-tensors |
-| `tools/smooth.py` | SmoothQuant folded into Qwen3.5's zero-centred `(1 + w)` RMSNorms before INT8 quantization |
+| `tools/quantize.py` | W8A8 checkpoints (FP8 or INT8), GDN projections included |
+| `tools/smooth.py` | SmoothQuant folded into Qwen3.5's RMSNorms |
 | `tools/gptq_w8a8.py` | GPTQ W8A8 through llm-compressor |
-| `bench/inproc/run.py` | the engine alone, in-process, pre-tokenized prompts: the backend's ceiling and its GPU load, any engine argument and scheduler |
-| `bench/profile/` | Nsight Systems capture of that run (`inproc_nsys.sh`); GPU busy, idle gaps and time per kernel class (`nsys_summary.py`) |
-| `bench/gdn/` | each GDN piece against vLLM's and an fp64 reference: conv (`conv_check.py`), the mixed step (`mixed_check.py`), FlashInfer capture (`fi_multi_capture.py`), the decode kernels (`decode_check.py`), the 8-bit states and their decode tiles (`state8_check.py`) |
-| `bench/front/check.py` | the frontend against vLLM's input path: vision towers vs a float32 ruler, and the engine's prompt ids, greedy replies and teacher-forced logprobs per path |
-| `bench/grammar/` | `check.py`: our masks vs xgrammar's at every step of generated documents and random walks, with `reference.py`, a separate recursive-descent judge, deciding each disagreement |
-| `bench/precision/` | generations and prompt logprobs of two engine configurations compared (KL, argmax agreement) |
-| `bench/legacy/probe.sh` | stock vLLM on older cards (2080 Ti sm75, V100 sm70) per checkpoint, dtype and graph mode |
-| `reports/` | measurements, dated |
 
-## Why
+`quantize.py` writes per-channel 8-bit weights with dynamic per-token activations over the
+linears named by suffix or by a reference checkpoint (`--like`); vLLM loads them as
+compressed-tensors.
 
-On an RTX 5090, Qwen3.5-4B FP8 behind `vllm serve` with GBC's captioning requests (one image,
-~1000 prompt tokens, ~100 reply tokens, JSON schema) leaves the GPU 35-55% busy: vLLM's engine
-thread spends its time running the GDN layers eagerly on every mixed prefill/decode step and
-filling grammar bitmasks, and the GPU waits for it. Driven in-process with no server, the same
-engine keeps the card 87% busy. Both paths stay: HTTP to a hosted server, and the engine
-in-process for local runs; KohakuvLLM's parts apply to both.
+## Benchmarks
+
+| Path | Measures |
+|---|---|
+| `bench/inproc/run.py` | the engine alone, in-process |
+| `bench/profile/` | Nsight capture; GPU busy, gaps, kernel classes |
+| `bench/gdn/` | each GDN piece vs vLLM's and an fp64 ruler |
+| `bench/front/check.py` | the frontend vs vLLM's input path |
+| `bench/grammar/` | our masks vs xgrammar's, with an independent judge |
+| `bench/precision/` | two engine configs: KL, argmax agreement |
+| `bench/legacy/probe.sh` | stock vLLM on older cards |
+
+Measurements, dated, are in [reports/](reports/).
 
 ## License
 
