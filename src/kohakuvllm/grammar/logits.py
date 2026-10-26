@@ -74,9 +74,11 @@ class JsonSchemaLogits(LogitsProcessor):
         n = req_states.max_num_reqs
         self.grammars: dict[str, int] = {}
         self.handles: dict[int, int] = {}  # request slot -> matcher handle
+        self.slot_handle = np.full(n, -1, dtype=np.int64)  # the same, -1 for none
         self.seen = np.zeros(n, dtype=np.int64)  # output tokens fed per slot
         self.total = torch.empty(n, dtype=torch.int32, pin_memory=True)
         self.last = torch.empty(n, dtype=torch.int32, pin_memory=True)
+        self.total_np, self.last_np = self.total.numpy(), self.last.numpy()
         self.side = torch.cuda.Stream(self.device)
         self.ready, self.copied = torch.cuda.Event(), torch.cuda.Event()
         # The per-row mask ids, staged in a ring so an in-flight copy is never overwritten
@@ -96,6 +98,7 @@ class JsonSchemaLogits(LogitsProcessor):
 
     def add_request(self, req_idx: int, sampling_params) -> bool:
         old = self.handles.pop(req_idx, None)
+        self.slot_handle[req_idx] = -1
         if old is not None:
             self.store.release(old)
         schema = (sampling_params.extra_args or {}).get(KEY)
@@ -104,7 +107,7 @@ class JsonSchemaLogits(LogitsProcessor):
         g = self.grammars.get(schema)
         if g is None:
             g = self.grammars[schema] = self.store.compile(schema)
-        self.handles[req_idx] = self.store.matcher(g)
+        self.handles[req_idx] = self.slot_handle[req_idx] = self.store.matcher(g)
         self.seen[req_idx] = 0
         return True
 
@@ -121,14 +124,8 @@ class JsonSchemaLogits(LogitsProcessor):
             self.last.copy_(last, non_blocking=True)
             self.copied.record(self.side)
 
-    def _new_tokens(self, slot: int, out_len: int) -> list[int]:
-        done = int(self.seen[slot])
-        self.seen[slot] = out_len
-        if out_len == done:
-            return []
-        if out_len == done + 1:
-            return [int(self.last[slot])]
-        # Several tokens since the last step (a resumed request): read them from the token rows
+    def _resumed(self, slot: int, done: int, out_len: int) -> list[int]:
+        """Several tokens since the last step (a resumed request), read from the token rows."""
         start = int(self.rs.prompt_len.np[slot])
         return self.rs.all_token_ids.gpu[slot, start + done : start + out_len].tolist()
 
@@ -139,26 +136,35 @@ class JsonSchemaLogits(LogitsProcessor):
         if logits.shape[0] != len(slots):
             raise NotImplementedError("kohakuvllm grammar: speculative decoding")
         self.copied.synchronize()
-        prompt = self.rs.prompt_len.np
-        rows, handles, news = [], [], []
-        for row, slot in enumerate(slots.tolist()):
-            h = self.handles.get(slot)
-            if h is None:
-                continue
-            out_len = int(self.total[slot]) - int(prompt[slot])
-            if out_len < self.seen[slot]:
-                raise RuntimeError(f"kohakuvllm grammar: slot {slot} lost output tokens")
-            rows.append(row)
-            handles.append(h)
-            news.append(self._new_tokens(slot, out_len))
-        if not rows:
+        # One numpy pass over the batch (a Python loop over ~1000 rows cost milliseconds a step)
+        hs = self.slot_handle[slots]
+        rows = np.flatnonzero(hs >= 0)
+        if not rows.size:
             return logits
+        sl = slots[rows]
+        out_len = self.total_np[sl].astype(np.int64) - self.rs.prompt_len.np[sl]
+        done = self.seen[sl]
+        if (out_len < done).any():
+            raise RuntimeError("kohakuvllm grammar: a slot lost output tokens")
+        self.seen[sl] = out_len
+        step = (out_len - done).tolist()
+        last = self.last_np[sl].tolist()
+        news = [
+            [t]
+            if k == 1
+            else []
+            if k == 0
+            else self._resumed(int(sl[i]), int(done[i]), int(out_len[i]))
+            for i, (k, t) in enumerate(zip(step, last))
+        ]
+        handles = hs[rows].tolist()
         ids = self.store.step(handles, news)
         self._upload()
         self.turn = (self.turn + 1) % len(self.staged)
         dense = self.staged[self.turn][: logits.shape[0]]
-        dense.fill_(-1)
-        dense[rows] = torch.tensor(ids, dtype=torch.int32)
+        view = dense.numpy()
+        view.fill(-1)
+        view[rows] = ids
         apply_masks(logits, self.table, dense.to(self.device, non_blocking=True))
         if time.monotonic() - self.stats_at > STATS_EVERY_S:
             self.stats_at = time.monotonic()
@@ -178,7 +184,10 @@ class JsonSchemaLogits(LogitsProcessor):
         raw = self.store.take_new()
         if not raw:
             return
+        # Pinned and asynchronous: a pageable copy waits for the forward in flight (the caching
+        # host allocator keeps the source alive until the copy has run)
         new = torch.frombuffer(bytearray(raw), dtype=torch.int32).view(-1, self.store.words)
+        new = new.pin_memory()
         end = self.uploaded + new.shape[0]
         if end > self.table.shape[0]:
             grown = torch.empty(
@@ -188,5 +197,5 @@ class JsonSchemaLogits(LogitsProcessor):
             )
             grown[: self.uploaded] = self.table[: self.uploaded]
             self.table = grown
-        self.table[self.uploaded : end].copy_(new)
+        self.table[self.uploaded : end].copy_(new, non_blocking=True)
         self.uploaded = end

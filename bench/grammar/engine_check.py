@@ -7,6 +7,7 @@ temperature 1.0 (wide walks through the grammar) and greedy, each judged by ``re
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -36,7 +37,8 @@ def main() -> int:
         limit_mm_per_prompt={"image": 4, "video": 0},
         logits_processors=["kohakuvllm.grammar:JsonSchemaLogits"],
     )
-    report = {"schemas": {}}
+    ws = int(os.environ.get("KOHAKU_GRAMMAR_WS", "8"))  # the engine's whitespace allowance
+    report = {"ws": ws, "schemas": {}}
     for path in sorted(Path(args.schemas).glob("*.json")):
         schema = json.loads(path.read_text(encoding="utf-8"))
         text = json.dumps(schema)
@@ -58,7 +60,7 @@ def main() -> int:
             verdicts = {"complete": 0, "prefix": 0, "bad": 0}
             bad = []
             for o in out[0].outputs:
-                v = judge(schema, o.text.encode())
+                v = judge(schema, o.text.encode(), ws)
                 if v == "prefix" and o.finish_reason != "length":
                     v = "bad"
                 verdicts[v] += 1

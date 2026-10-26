@@ -6,7 +6,8 @@ are opted into by configuration: ``--scheduler-cls kohakuvllm.sched.PhasedSchedu
 ``KOHAKU_GDN_STATE=fp8`` or ``int8`` for the GDN recurrent state in 8 bits (``gdn.state8``; not
 with ``hybrid``), ``KOHAKU_GDN_STATE_TILE=ROWSxWARPS`` its decode kernel's tile (``state8.TILE``
 by default); ``KOHAKU_NVFP4=norm,quant,head=nvfp4`` for our NVFP4 producers and LM head
-(``nvfp4``).
+(``nvfp4``); ``KOHAKU_MAMBA_JUNCTION=1`` for GDN states cached at the exact shared-prefix junction
+(``cache.junction``, with ``--prefix-match-unit``).
 """
 
 import logging
@@ -16,7 +17,9 @@ import vllm
 from packaging.version import Version
 
 from kohakuvllm import TESTED_VLLM, nvfp4
+from kohakuvllm.cache import junction
 from kohakuvllm.gdn import hybrid, state8
+from kohakuvllm.sched import fastalloc
 
 log = logging.getLogger("kohakuvllm")
 
@@ -38,6 +41,11 @@ def register() -> None:
     if mode in ("hybrid", "check"):
         hybrid.install(os.environ.get("KOHAKU_GDN_CHECK", "gdn_check") if mode == "check" else None)
         log.info("kohakuvllm: hybrid GDN step installed (%s)", mode)
+    if os.environ.get("KOHAKU_MAMBA_JUNCTION", "") == "1":
+        junction.install()
+    fast = os.environ.get("KOHAKU_FAST_ALLOC", "")
+    if fast in ("on", "check"):
+        fastalloc.install(fast)
     spec = os.environ.get("KOHAKU_NVFP4", "")
     if spec:
         log.info("kohakuvllm: NVFP4 %s", nvfp4.install(spec))

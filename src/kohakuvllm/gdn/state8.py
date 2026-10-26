@@ -1,10 +1,11 @@
 """The GDN recurrent state in 8 bits (FP8 E4M3 or INT8): half the bytes of a bf16 state, read and
 written by every decode step.
 
-Layout: vLLM's state pool holds, per slot, ``[HV, V, K + 4]`` bytes: each state row (``K``
-values) in 8 bits, then that row's float32 scale (``amax / 448`` for FP8, ``amax / 127`` for
-INT8). ``install(fmt)`` makes vLLM size the pool that way (the GDN state shape and dtype) and
-routes every use of the state through this module:
+Layout: vLLM's state pool holds, per slot, ``[HV, V, K + 4]`` bytes; per value-head, its ``V * K``
+values in 8 bits (row-major ``[V, K]``, so every row starts 16-byte aligned), then the ``V`` rows'
+float32 scales (``amax / 448`` for FP8, ``amax / 127`` for INT8). ``install(fmt)`` makes vLLM
+size the pool that way (the GDN state shape and dtype) and routes every use of the state through
+this module:
 
 - decodes (vLLM's packed decode and its sigmoid-gating update for single-token sequences): one
   Triton kernel reads a row tile, dequantizes, runs the gated delta rule step in float32, and
@@ -34,8 +35,11 @@ TILE = {"rows": 8, "warps": 1}
 
 def split(pool: torch.Tensor, k: int, fmt: str) -> tuple[torch.Tensor, torch.Tensor]:
     """``pool`` [..., V, K + 4] uint8 -> its values [..., V, K] in ``fmt`` and scales [..., V]
-    float32 (views)."""
-    return pool[..., :k].view(FORMATS[fmt][0]), pool[..., k:].view(torch.float32)[..., 0]
+    float32 (views; per head the values come first, then the scales)."""
+    v = pool.shape[-2]
+    flat = pool.flatten(-2)
+    values = flat[..., : v * k].unflatten(-1, (v, k))
+    return values.view(FORMATS[fmt][0]), flat[..., v * k :].view(torch.float32)
 
 
 def quantize(state: torch.Tensor, out: torch.Tensor, fmt: str) -> torch.Tensor:
@@ -84,7 +88,8 @@ def decode_kernel(
     INT8: tl.constexpr,
 ):
     """One token of one sequence, one value-head, ``BV`` state rows."""
-    i_v, i_nh = tl.program_id(0), tl.program_id(1)
+    # sequences x value-heads on axis 0 (up to 2^31 - 1 programs; axis 1 stops at 65535)
+    i_nh, i_v = tl.program_id(0), tl.program_id(1)
     i_n, i_hv = i_nh // HV, i_nh % HV
     i_h = i_hv // (HV // H)
     o_k = tl.arange(0, K)
@@ -96,10 +101,10 @@ def decode_kernel(
         tl.store(p_o, tl.zeros([BV], dtype=tl.float32).to(p_o.dtype.element_ty))
         return
 
-    ROW: tl.constexpr = K + 4
-    p_row = pool + slot * stride_slot + (i_hv * V + o_v) * ROW
-    raw = tl.load(p_row[:, None] + o_k[None, :])
-    p_scale = (p_row + K).to(tl.pointer_type(tl.float32))
+    p_head = pool + slot * stride_slot + i_hv * (V * (K + 4))
+    p_row = p_head + o_v * K
+    raw = tl.load(p_row[:, None] + o_k[None, :], eviction_policy="evict_first")
+    p_scale = (p_head + V * K).to(tl.pointer_type(tl.float32)) + o_v
     if INT8:
         h = raw.to(tl.int8, bitcast=True).to(tl.float32)
     else:
@@ -133,7 +138,9 @@ def decode_kernel(
     else:
         s = amax / 448.0
         q8 = (h / s[:, None]).to(tl.float8e4nv)
-    tl.store(p_row[:, None] + o_k[None, :], q8.to(tl.uint8, bitcast=True))
+    tl.store(
+        p_row[:, None] + o_k[None, :], q8.to(tl.uint8, bitcast=True), eviction_policy="evict_first"
+    )
     tl.store(p_scale, s)
 
 
@@ -153,7 +160,7 @@ def decode(
         raise ValueError(
             f"8-bit GDN state: K {K} must be a power of two and V {V} a multiple of {BV}"
         )
-    grid = (triton.cdiv(V, BV), n * HV)
+    grid = (n * HV, triton.cdiv(V, BV))
     decode_kernel[grid](
         q,
         k,
