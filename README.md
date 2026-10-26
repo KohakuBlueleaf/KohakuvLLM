@@ -1,9 +1,10 @@
 # KohakuvLLM
 
-Faster serving of small hybrid VLMs (Qwen3.5: Gated DeltaNet + full attention, with a vision
-tower) on [vLLM](https://github.com/vllm-project/vllm): our own scheduler, JSON grammar, 8-bit
-GDN state and quantizer, as a plugin package beside a stock vLLM wheel. Nothing is forked,
-patched on disk or recompiled; with no option set, vLLM runs as shipped. [TESTED.md](TESTED.md)
+A [vLLM](https://github.com/vllm-project/vllm) plugin that makes `vllm serve` faster on small
+hybrid VLMs (Qwen3.5: Gated DeltaNet + full attention, with a vision tower): our scheduler, KV
+allocation shortcut, JSON grammar, 8-bit GDN state and NVFP4 kernels, plus a quantizer. Install
+it beside a stock vLLM wheel and set `KOHAKU_VLLM=1`. Nothing is forked, patched on disk or
+recompiled; with `KOHAKU_VLLM` unset, vLLM runs as shipped. [TESTED.md](TESTED.md)
 names the vLLM versions each part was verified on. To use it, follow the
 [tutorial](#tutorial-serve-qwen35-4b-with-everything-on).
 
@@ -90,7 +91,7 @@ already has vLLM (`pip install vllm`, see [TESTED.md](TESTED.md) for the version
 ```bash
 git clone https://github.com/KohakuBlueleaf/KohakuvLLM
 cd KohakuvLLM
-pip install -e .                  # the plugin: scheduler, GDN state, frontend, tools
+pip install -e .                  # the plugin (vLLM loads it by itself)
 pip install maturin
 pip install ./grammar             # the Rust grammar matcher (needs a Rust toolchain: rustup.rs)
 ```
@@ -114,22 +115,30 @@ to serve `qwen35-4b-fp8` (or the BF16 `Qwen/Qwen3.5-4B`) instead.
 ### 3. Serve
 
 ```bash
-KOHAKU_GDN_STATE=int8 KOHAKU_PREFILL_EVERY=16 VLLM_HTTP_TIMEOUT_KEEP_ALIVE=60 \
+KOHAKU_VLLM=1 VLLM_HTTP_TIMEOUT_KEEP_ALIVE=60 \
 vllm serve qwen35-4b-fp8-gdn --served-model-name qwen3.5-4b \
     --gpu-memory-utilization 0.90 --max-num-seqs 384 --max-model-len 8192 \
     --limit-mm-per-prompt '{"image": 1}' \
-    --mamba-ssm-cache-dtype bfloat16 \
-    --scheduler-cls kohakuvllm.sched.PhasedScheduler \
-    --logits-processors kohakuvllm.grammar:JsonSchemaLogits
+    --mamba-ssm-cache-dtype bfloat16
 ```
 
-Each line is one part; drop any of them to turn it off:
+The package is a vLLM plugin: installed, `vllm serve` loads it in every process, with no class
+path flag. `KOHAKU_VLLM` is the one switch (unset: vLLM runs as shipped):
+
+| `KOHAKU_VLLM` item | Part |
+|---|---|
+| `1` | the default set: `sched,alloc,state,nvfp4` |
+| `sched=16` | `PhasedScheduler`, one step in 16 admits prefill (4 by default) |
+| `alloc` | the `allocate_slots` shortcut |
+| `state=int8` | the 8-bit GDN state (`fp8` on sm89+) |
+| `nvfp4` | our NVFP4 producers (NVFP4 checkpoints only) |
+| `-alloc` | drops a part of the default set (`KOHAKU_VLLM=1,-alloc`) |
+
+The JSON grammar needs no switch: a request that carries a schema gets it, the others never touch
+it. Other vLLM options worth setting:
 
 | Option | Part |
 |---|---|
-| `KOHAKU_GDN_STATE=int8` | the 8-bit GDN state (`fp8` on sm89+) |
-| `--scheduler-cls ... KOHAKU_PREFILL_EVERY=16` | `PhasedScheduler` |
-| `--logits-processors ...` | the JSON grammar |
 | `--mamba-ssm-cache-dtype bfloat16` | vLLM's own bf16 GDN state (the x2.1 step) |
 | `VLLM_HTTP_TIMEOUT_KEEP_ALIVE=60` | no dropped requests when the API server stalls |
 
@@ -182,78 +191,114 @@ Supported schema keywords: `object` (`properties`, `required`; keys in schema or
 import json
 from vllm import LLM, SamplingParams
 
-llm = LLM(
-    "qwen35-4b-fp8-gdn",
-    mamba_ssm_cache_dtype="bfloat16",
-    scheduler_cls="kohakuvllm.sched.PhasedScheduler",
-    logits_processors=["kohakuvllm.grammar:JsonSchemaLogits"],
-)
+llm = LLM("qwen35-4b-fp8-gdn", mamba_ssm_cache_dtype="bfloat16")
 params = SamplingParams(max_tokens=512, extra_args={"kohaku_json_schema": json.dumps(schema)})
 ```
 
-`KOHAKU_GDN_STATE` and `KOHAKU_PREFILL_EVERY` are read from the environment, as above.
+with `KOHAKU_VLLM=1` in the environment, as above.
 
 ## The parts
 
-| Part | Turn on | Gain |
+| Part | `KOHAKU_VLLM` | Gain |
 |---|---|---|
-| [`PhasedScheduler`](#phasedscheduler) | `--scheduler-cls` | +16% |
-| [`grammar`](#grammar) | `--logits-processors` | +8% vs xgrammar |
-| [`gdn.state8`](#gdnstate8) | `KOHAKU_GDN_STATE` | +5% |
+| [`sched`](#sched) | `sched[=N]` | +16% (RTX 5090), +8% at N=16 (B300) |
+| [`alloc`](#alloc) | `alloc` | +9% (B300, Qwen3.5-9B NVFP4) |
+| [`grammar`](#grammar) | none (per request) | +8% vs xgrammar |
+| [`gdn.state8`](#gdnstate8) | `state=int8` | +5% |
+| [`nvfp4`](#nvfp4) | `nvfp4`, `lmhead=fp8` | NVFP4 checkpoints |
+| [`kernels`](#kernels) | (used by the parts) | |
 | [`tools/quantize.py`](#tools) | an FP8-GDN checkpoint | +11% |
-| [`front`](#front) | in-process | off by default |
-| [`gdn.hybrid`](#gdnhybrid) | `KOHAKU_GDN=hybrid` | off by default |
 
 `kohakuvllm.plugin` is the `vllm.general_plugins` entry point: it warns once when vLLM is newer
-than `TESTED_VLLM` and installs `gdn.state8` or `gdn.hybrid` when their variables ask for them.
+than `TESTED_VLLM` and installs the parts `KOHAKU_VLLM` names (`kohakuvllm.features`). The
+variables before it (`KOHAKU_PREFILL_EVERY`, `KOHAKU_GDN_STATE`, `KOHAKU_NVFP4`,
+`KOHAKU_FAST_ALLOC`, `KOHAKU_GRAMMAR_WS`) still work, with a warning.
 
-### PhasedScheduler
+### sched
 
-Subclasses vLLM's `AsyncScheduler`. Between prefill steps it calls vLLM's own prefill throttle
-with the saturation escape off, so those steps are uniform decode batches that replay full CUDA
-graphs.
+`PhasedScheduler` subclasses vLLM's `AsyncScheduler` and becomes vLLM's scheduler when no
+`--scheduler-cls` is given. Between prefill steps it calls vLLM's own prefill throttle with the
+saturation escape off, so those steps are uniform decode batches that replay full CUDA graphs.
 
-- `KOHAKU_PREFILL_EVERY` (4): one step in that many admits prefill; 1 is vLLM's own scheduling.
+- `sched=N` (4): one step in N admits prefill; 1 is vLLM's own scheduling. On a B300 with
+  Qwen3.5-9B NVFP4, 16 beats 4 (92.7 vs 85.8 requests/s).
 - Use it with our grammar: with xgrammar it costs 22%. Under a saturated offline queue of
   uniform text prompts it also costs (17.8 -> 14.8 requests/s): there, batching prefill wins.
 
+### alloc
+
+vLLM's `KVCacheManager.allocate_slots` runs for every scheduled request every step and walks
+every KV cache group in Python. On a hybrid model at a thousand running requests that walk was
+a fifth of the engine core's time. A running request whose new tokens stay inside blocks it
+already holds, in every group, gets nothing from it, and `alloc` returns vLLM's empty result for
+those directly. `alloc=check` runs vLLM's code as well and counts any call where it changed a
+block: 0 of 600k on Qwen3.5-9B NVFP4, where 96% of calls take the shortcut. B300, the same
+replay with `sched=16,state=int8`: 90.7 -> 99.2 requests/s.
+
+### On a B300
+
+`vllm serve` alone on recorded captioning requests (Qwen3.5-9B NVFP4, 6144 requests, 1024 in
+flight; one run each, so a few percent is noise):
+
+| `KOHAKU_VLLM` | requests/s |
+|---|---|
+| `sched=16,state=int8` | 90.7 |
+| `sched=16,state=int8,alloc` | 99.2 |
+| `1,sched=16` | 100.9 |
+| `1,sched=16,-state` | 97.3 |
+| (unset: vLLM as shipped, grammar per request) | 103.6 |
+
+The card stays under half busy in all of them: the engine's single Python loop is the limit, not
+the GPU. The replay is not the whole story: under a full captioning pipeline (two engines beside
+the detector on the same card), `sched=4,state=int8` serves 39.7 requests/s against 34.3 for
+vLLM as shipped, so measure on your own workload.
+
 ### grammar
 
-A vLLM v1 logits processor over the Rust matcher in `grammar/` (`kohakuvllm-grammar`).
+A vLLM logits processor (Model Runner V2) over the Rust matcher in `grammar/`
+(`kohakuvllm-grammar`), registered as a `vllm.logits_processors` plugin.
 
 - Byte-level JSON for object, array, string with lengths, number, boolean, null and enum. Its
   counters clamp to the longest token, so each distinct state's mask is built once (a token-trie
   walk) and copied once to a GPU table.
-- A step is one Rust call for the batch and one mask id per row; one Triton kernel masks the
-  logits. The last tokens are read on the worker, so nothing waits in the scheduler.
-- `KOHAKU_GRAMMAR_WS` (8): whitespace bytes allowed per gap; 0 is compact JSON.
+- A step is one Rust call for the batch and one mask id per row; one kernel (`grammar_mask`)
+  masks the logits. The last tokens are read on the worker, so nothing waits in the scheduler.
+- `grammar_ws=N` (8): whitespace bytes allowed per gap; 0 is compact JSON.
+- Also given by `--logits-processors kohakuvllm.grammar:JsonSchemaLogits` (older setups): the
+  second instance stays inert.
 
 ### gdn.state8
 
 The GDN recurrent state in 8 bits with a float32 scale per row: half the bytes of the bf16 state,
 11% more KV tokens in the same memory.
 
-- `KOHAKU_GDN_STATE=int8` or `fp8` (FP8 needs sm89+); `KOHAKU_GDN_STATE_TILE=ROWSxWARPS` (8x1).
-- Decodes run one Triton kernel that dequantizes, steps and requantizes each row; prefills
+- `state=int8` or `fp8` (FP8 needs sm89+).
+- Decodes run `gdn_state8_decode`, which dequantizes, steps and requantizes each row; prefills
   dequantize before vLLM's chunked kernel and quantize its final states.
 - Error against an fp64 ruler over 64 decode steps, per state row: bf16 0.17%, INT8 0.64%, FP8
   2.7%, no growth over steps. Replies stay valid at the same lengths.
-- Pays most where the KV cache is the limit. Not with `gdn.hybrid` or speculative decoding.
+- Pays most where the KV cache is the limit. Not with speculative decoding.
 
-### front
+### nvfp4
 
-Feeds vLLM's `enable_mm_embeds` path: chat template and image processor in a pool of worker
-processes, the model's own vision tower (bf16, or FP8 linears on sm89+) on its own CUDA stream.
-Prompt ids are identical to vLLM's path. Off by default: on a busy host it was slower than
-vLLM's own input path. `Frontend(llm, model)` around an `AsyncLLM`.
+On NVFP4 checkpoints (sm100 / sm120), a torch.compile pass puts our producers
+(`nvfp4_quant`, and `rmsnorm_nvfp4` with the RMSNorm fused into the quantizations it feeds) in
+place of vLLM's; byte for byte vLLM's `scaled_fp4_quant`. `lmhead=fp8` or `nvfp4` quantizes the
+LM head too.
 
-### gdn.hybrid
+### kernels
 
-`KOHAKU_GDN=hybrid` runs the GDN core of mixed steps as one fixed launch sequence (our Triton
-varlen conv, FLA's recurrent decode, FlashInfer's chunked prefill) so piecewise CUDA graphs
-capture it. Each piece matches vLLM's within the fp32 reference's error and is faster per layer
-(0.18-0.58 vs 0.43-0.93 ms), but end to end it does not gain on a power-bound card.
-`KOHAKU_GDN=check` runs it beside vLLM's core and logs the difference per layer and step.
+`kohakuvllm.kernels` is an op registry. Each op has an eager reference and per-arch kernels; a
+caller resolves an op once and falls back along the arch's priority (sm10x: Gluon, Triton,
+eager; sm80-sm90 and sm12x: Triton, eager) when a backend cannot build or launch. A kernel
+written for one card serves every card that can run it. `python bench/kernels/check.py` checks every
+backend against the eager reference on the card it runs on.
+
+| Op | Backends |
+|---|---|
+| `nvfp4_quant`, `rmsnorm_nvfp4` | Triton, eager (vLLM's ops) |
+| `grammar_mask` | Triton, eager |
+| `gdn_state8_decode` | Triton, eager |
 
 ## Tools
 
@@ -267,10 +312,10 @@ capture it. Each piece matches vLLM's within the fp32 reference's error and is f
 
 | Path | Measures |
 |---|---|
+| `bench/kernels/check.py` | every kernel backend against its eager reference, on this card |
 | `bench/inproc/run.py` | the engine alone, in-process |
 | `bench/profile/` | Nsight capture; GPU busy, gaps, kernel classes |
-| `bench/gdn/` | each GDN piece vs vLLM's and an fp64 ruler |
-| `bench/front/check.py` | the frontend vs vLLM's input path |
+| `bench/gdn/` | the 8-bit GDN state vs an fp64 ruler, decode speed per tile |
 | `bench/grammar/` | our masks vs xgrammar's, with an independent judge |
 | `bench/precision/` | two engine configs: KL, argmax agreement |
 

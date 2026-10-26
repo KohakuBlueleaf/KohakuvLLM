@@ -7,9 +7,9 @@ float32 scales (``amax / 448`` for FP8, ``amax / 127`` for INT8). ``install(fmt)
 size the pool that way (the GDN state shape and dtype) and routes every use of the state through
 this module:
 
-- decodes (vLLM's packed decode and its sigmoid-gating update for single-token sequences): one
-  Triton kernel reads a row tile, dequantizes, runs the gated delta rule step in float32, and
-  writes the row back requantized with a fresh scale;
+- decodes (vLLM's packed decode and its sigmoid-gating update for single-token sequences): the
+  registry's ``gdn_state8_decode`` (``kohakuvllm.kernels``) reads the rows, dequantizes, runs the
+  gated delta rule step in float32, and writes the rows back requantized with fresh scales;
 - prefills: vLLM gathers the prefill sequences' states and hands them to its chunked kernel;
   the gathered bytes are dequantized before it, and its final states quantized after it, so the
   pool takes them back as bytes.
@@ -19,18 +19,17 @@ FP8 needs sm89 and up (Triton's E4M3); INT8 runs on any card. Spec decoding is n
 """
 
 import torch
-import triton
-import triton.language as tl
 from vllm.model_executor.layers.mamba import mamba_utils
 from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn as gdn
+
+from kohakuvllm.kernels import registry
+from kohakuvllm.kernels.backends.triton.gdn import entry as triton_gdn
 
 FORMATS = {"fp8": (torch.float8_e4m3fn, 448.0), "int8": (torch.int8, 127.0)}
 SCALE_BYTES = 4
 _ORIGINAL = {}
 _FORMAT = {"name": "fp8"}
-# The decode kernel's state rows and warps per program (install's ``tile``); 8x1 and the larger
-# tiles are level on a 5090 (1.9x the bf16 pool)
-TILE = {"rows": 8, "warps": 1}
+_BOUND: dict = {}
 
 
 def split(pool: torch.Tensor, k: int, fmt: str) -> tuple[torch.Tensor, torch.Tensor]:
@@ -59,136 +58,16 @@ def dequantize(pool: torch.Tensor, k: int, fmt: str, dtype=torch.float32) -> tor
     return (values.float() * scales[..., None]).to(dtype)
 
 
-@triton.jit
-def decode_kernel(
-    q,
-    k,
-    v,
-    a,
-    b,
-    A_log,
-    dt_bias,
-    o,
-    pool,
-    slots,
-    scale,
-    stride_q,
-    stride_k,
-    stride_v,
-    stride_a,
-    stride_b,
-    stride_o,
-    stride_slot,
-    H: tl.constexpr,
-    HV: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    BV: tl.constexpr,
-    L2NORM: tl.constexpr,
-    INT8: tl.constexpr,
-):
-    """One token of one sequence, one value-head, ``BV`` state rows."""
-    # sequences x value-heads on axis 0 (up to 2^31 - 1 programs; axis 1 stops at 65535)
-    i_nh, i_v = tl.program_id(0), tl.program_id(1)
-    i_n, i_hv = i_nh // HV, i_nh % HV
-    i_h = i_hv // (HV // H)
-    o_k = tl.arange(0, K)
-    o_v = i_v * BV + tl.arange(0, BV)
-    p_o = o + i_n * stride_o + i_hv * V + o_v
-
-    slot = tl.load(slots + i_n).to(tl.int64)
-    if slot <= 0:
-        tl.store(p_o, tl.zeros([BV], dtype=tl.float32).to(p_o.dtype.element_ty))
-        return
-
-    p_head = pool + slot * stride_slot + i_hv * (V * (K + 4))
-    p_row = p_head + o_v * K
-    raw = tl.load(p_row[:, None] + o_k[None, :], eviction_policy="evict_first")
-    p_scale = (p_head + V * K).to(tl.pointer_type(tl.float32)) + o_v
-    if INT8:
-        h = raw.to(tl.int8, bitcast=True).to(tl.float32)
-    else:
-        h = raw.to(tl.float8e4nv, bitcast=True).to(tl.float32)
-    h *= tl.load(p_scale)[:, None]
-
-    b_q = tl.load(q + i_n * stride_q + i_h * K + o_k).to(tl.float32)
-    b_k = tl.load(k + i_n * stride_k + i_h * K + o_k).to(tl.float32)
-    b_v = tl.load(v + i_n * stride_v + i_hv * V + o_v).to(tl.float32)
-    if L2NORM:
-        b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
-        b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
-    b_q = b_q * scale
-
-    x = tl.load(a + i_n * stride_a + i_hv).to(tl.float32) + tl.load(dt_bias + i_hv).to(tl.float32)
-    softplus = tl.where(x <= 20.0, tl.log(1.0 + tl.exp(x)), x)
-    g = -tl.exp(tl.load(A_log + i_hv).to(tl.float32)) * softplus
-    beta = tl.sigmoid(tl.load(b + i_n * stride_b + i_hv).to(tl.float32))
-
-    h *= tl.exp(g)
-    b_v -= tl.sum(h * b_k[None, :], 1)
-    b_v *= beta
-    h += b_v[:, None] * b_k[None, :]
-    tl.store(p_o, tl.sum(h * b_q[None, :], 1).to(p_o.dtype.element_ty))
-
-    amax = tl.maximum(tl.max(tl.abs(h), 1), 1e-30)
-    if INT8:
-        s = amax / 127.0
-        x8 = h / s[:, None]
-        q8 = tl.where(x8 >= 0, x8 + 0.5, x8 - 0.5).to(tl.int8)
-    else:
-        s = amax / 448.0
-        q8 = (h / s[:, None]).to(tl.float8e4nv)
-    tl.store(
-        p_row[:, None] + o_k[None, :], q8.to(tl.uint8, bitcast=True), eviction_policy="evict_first"
-    )
-    tl.store(p_scale, s)
-
-
 def decode(
     q, k, v, a, b, A_log, dt_bias, pool, slots, out, scale: float, l2norm: bool, fmt: str, tile=None
 ):
     """One decode step of ``N`` sequences on the 8-bit pool. ``q``, ``k`` [N, H * K], ``v``
     [N, HV * V] (row strides free), ``a``, ``b`` [N, HV], ``slots`` [N], ``out`` [N, HV * V];
-    ``tile``: ``{"rows", "warps"}``, ``TILE`` by default."""
-    tile = tile or TILE
-    n = q.shape[0]
-    HV, V, row = pool.shape[-3:]
-    K = row - SCALE_BYTES
-    H = q.shape[1] // K
-    BV = min(triton.next_power_of_2(V), tile["rows"])
-    if triton.next_power_of_2(K) != K or V % BV:
-        raise ValueError(
-            f"8-bit GDN state: K {K} must be a power of two and V {V} a multiple of {BV}"
-        )
-    grid = (n * HV, triton.cdiv(V, BV))
-    decode_kernel[grid](
-        q,
-        k,
-        v,
-        a,
-        b,
-        A_log,
-        dt_bias,
-        out,
-        pool,
-        slots,
-        scale,
-        q.stride(0),
-        k.stride(0),
-        v.stride(0),
-        a.stride(0),
-        b.stride(0),
-        out.stride(0),
-        pool.stride(0),
-        H=H,
-        HV=HV,
-        K=K,
-        V=V,
-        BV=BV,
-        L2NORM=l2norm,
-        INT8=fmt == "int8",
-        num_warps=tile["warps"],
-    )
+    the registry's ``gdn_state8_decode`` (``tile``: the Triton kernel's ``{"rows", "warps"}``)."""
+    key = (q.device, pool.dtype)
+    if key not in _BOUND:
+        _BOUND[key] = registry.resolve("gdn_state8_decode", q.device, q.dtype)
+    _BOUND[key](q, k, v, a, b, A_log, dt_bias, pool, slots, out, scale, l2norm, fmt, tile=tile)
 
 
 # ---- vLLM's entry points ------------------------------------------------------------------------
@@ -311,7 +190,7 @@ def install(fmt: str, tile: dict | None = None) -> None:
     if fmt not in FORMATS:
         raise ValueError(f"8-bit GDN state: format {fmt!r} not in {sorted(FORMATS)}")
     _FORMAT["name"] = fmt
-    TILE.update(tile or {})
+    triton_gdn.TILE.update(tile or {})
     calc_shape = mamba_utils.MambaStateShapeCalculator
     calc_dtype = mamba_utils.MambaStateDtypeCalculator
     _ORIGINAL.update(

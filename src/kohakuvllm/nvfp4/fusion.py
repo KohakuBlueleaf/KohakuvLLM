@@ -27,7 +27,9 @@ from vllm.compilation.passes import pass_manager
 from vllm.compilation.passes.vllm_inductor_pass import VllmInductorPass
 from vllm.config import VllmConfig
 
-from kohakuvllm.nvfp4 import kernels, ops
+from kohakuvllm.kernels.backends.triton.nvfp4 import _kernels as kernels
+from kohakuvllm.kernels.backends.triton.nvfp4 import entry as triton_nvfp4
+from kohakuvllm.nvfp4 import ops
 
 # Under vLLM's logger, so the lines reach vLLM's handler in every process
 log = logging.getLogger("vllm.kohakuvllm")
@@ -171,11 +173,13 @@ class Nvfp4FusionPass(VllmInductorPass):
         log.info("kohakuvllm nvfp4: %d norm+quant fused, %d quantizations ours", norms, quants)
 
     def uuid(self) -> str:
-        return self.hash_source(self, kernels, ops, f"parts={sorted(PARTS)}")
+        return self.hash_source(self, kernels, triton_nvfp4, ops, f"parts={sorted(PARTS)}")
 
 
 def source_hash() -> str:
-    text = "".join(inspect.getsource(m) for m in (kernels, ops, sys.modules[__name__]))
+    text = "".join(
+        inspect.getsource(m) for m in (kernels, triton_nvfp4, ops, sys.modules[__name__])
+    )
     return hashlib.sha256((text + repr(sorted(PARTS))).encode()).hexdigest()
 
 

@@ -1,27 +1,21 @@
-"""vLLM's general-plugin entry point: runs at import in every vLLM process.
+"""vLLM's general-plugin entry point: runs at import in every vLLM process and installs the
+features ``KOHAKU_VLLM`` names (``kohakuvllm.features``). With it unset, vLLM runs as shipped.
 
-It warns once when the installed vLLM is newer than the last tested one (TESTED.md). The parts
-are opted into by configuration: ``--scheduler-cls kohakuvllm.sched.PhasedScheduler``;
-``KOHAKU_GDN=hybrid`` in the environment for the graph-captured mixed GDN step (``gdn.hybrid``);
-``KOHAKU_GDN_STATE=fp8`` or ``int8`` for the GDN recurrent state in 8 bits (``gdn.state8``; not
-with ``hybrid``), ``KOHAKU_GDN_STATE_TILE=ROWSxWARPS`` its decode kernel's tile (``state8.TILE``
-by default); ``KOHAKU_NVFP4=norm,quant,head=nvfp4`` for our NVFP4 producers and LM head
-(``nvfp4``); ``KOHAKU_MAMBA_JUNCTION=1`` for GDN states cached at the exact shared-prefix junction
-(``cache.junction``, with ``--prefix-match-unit``).
+It warns once when the installed vLLM is newer than the last tested one (TESTED.md).
 """
 
 import logging
-import os
 
 import vllm
 from packaging.version import Version
 
-from kohakuvllm import TESTED_VLLM, nvfp4
+from kohakuvllm import TESTED_VLLM, features, nvfp4
 from kohakuvllm.cache import junction
-from kohakuvllm.gdn import hybrid, state8
-from kohakuvllm.sched import fastalloc
+from kohakuvllm.gdn import state8
+from kohakuvllm.grammar import logits as grammar
+from kohakuvllm.sched import fastalloc, phased
 
-log = logging.getLogger("kohakuvllm")
+log = logging.getLogger("vllm.kohakuvllm")
 
 
 def register() -> None:
@@ -29,23 +23,22 @@ def register() -> None:
         log.warning(
             "kohakuvllm was last tested on vLLM %s; running on %s", TESTED_VLLM, vllm.__version__
         )
-    mode = os.environ.get("KOHAKU_GDN", "")
-    state = os.environ.get("KOHAKU_GDN_STATE", "")
-    if state:
-        if mode:
-            raise ValueError("KOHAKU_GDN_STATE and KOHAKU_GDN=hybrid / check cannot combine")
-        tile = os.environ.get("KOHAKU_GDN_STATE_TILE", "")
-        rows, _, warps = tile.partition("x")
-        state8.install(state, {"rows": int(rows), "warps": int(warps)} if tile else None)
-        log.info("kohakuvllm: GDN recurrent state in %s", state)
-    if mode in ("hybrid", "check"):
-        hybrid.install(os.environ.get("KOHAKU_GDN_CHECK", "gdn_check") if mode == "check" else None)
-        log.info("kohakuvllm: hybrid GDN step installed (%s)", mode)
-    if os.environ.get("KOHAKU_MAMBA_JUNCTION", "") == "1":
+    chosen = features.from_env()
+    if not chosen:
+        return
+    if "sched" in chosen:
+        phased.install(int(chosen["sched"]))
+    if "alloc" in chosen:
+        fastalloc.install(chosen["alloc"])
+    if "state" in chosen:
+        state8.install(chosen["state"])
+    if "nvfp4" in chosen or "lmhead" in chosen:
+        spec = ",".join(chosen.get("nvfp4", "").split("+"))
+        if "lmhead" in chosen:
+            spec += f",head={chosen['lmhead']}"
+        nvfp4.install(spec)
+    if "junction" in chosen:
         junction.install()
-    fast = os.environ.get("KOHAKU_FAST_ALLOC", "")
-    if fast in ("on", "check"):
-        fastalloc.install(fast)
-    spec = os.environ.get("KOHAKU_NVFP4", "")
-    if spec:
-        log.info("kohakuvllm: NVFP4 %s", nvfp4.install(spec))
+    if "grammar_ws" in chosen:
+        grammar.WS["bytes"] = int(chosen["grammar_ws"])
+    log.info("kohakuvllm: %s", ",".join(f"{k}={v}" for k, v in chosen.items()))

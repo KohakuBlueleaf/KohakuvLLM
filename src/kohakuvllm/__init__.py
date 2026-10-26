@@ -1,5 +1,6 @@
-"""KohakuvLLM: our own frontend and kernels for small hybrid VLMs, with vLLM's engine as the
-backend; a drop-in plugin package (no fork, no patch, no rebuild)."""
+"""KohakuvLLM: a vLLM plugin that makes ``vllm serve`` faster on small hybrid VLMs (Qwen3.5:
+Gated DeltaNet + full attention, with a vision tower). No fork, no patch on disk, no rebuild;
+``KOHAKU_VLLM`` (``kohakuvllm.features``) turns its parts on."""
 
-__version__ = "0.0.1"
+__version__ = "0.1.0"
 TESTED_VLLM = "0.32.0"

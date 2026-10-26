@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "kohakuvllm"
-version = "0.0.1"
-description = "Our own frontend and kernels for small hybrid VLMs (Qwen3.5 / GDN) at full GPU load, with vLLM's engine as the backend; a drop-in vLLM plugin package"
+version = "0.1.0"
+description = "A vLLM plugin that makes vllm serve faster on small hybrid VLMs (Qwen3.5 / GDN): scheduler, KV allocation, JSON grammar, 8-bit GDN state, NVFP4 kernels"
 authors = [
     { name = "Shih-Ying Yeh(KohakuBlueLeaf)", email = "apolloyeh0123@gmail.com" },
 ]
@@ -32,6 +32,9 @@ dev = ["ruff", "black"]
 
 [project.entry-points."vllm.general_plugins"]
 kohakuvllm = "kohakuvllm.plugin:register"
+
+[project.entry-points."vllm.logits_processors"]
+kohakuvllm_json = "kohakuvllm.grammar:JsonSchemaLogits"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/kohakuvllm"]

@@ -112,8 +112,7 @@ def main() -> int:
     tables = {r[0] for r in cur.execute("select name from sqlite_master where type='table'")}
     names = dict(cur.execute("select id, value from StringIds"))
     allk = cur.execute(
-        "select start, end, demangledName, correlationId, globalPid "
-        "from CUPTI_ACTIVITY_KIND_KERNEL"
+        "select start, end, demangledName, correlationId, globalPid from CUPTI_ACTIVITY_KIND_KERNEL"
     ).fetchall()
     t0, t1 = min(k[0] for k in allk), max(k[1] for k in allk)
     lo, hi = t0 + args.trim * (t1 - t0), t1 - args.trim * (t1 - t0)

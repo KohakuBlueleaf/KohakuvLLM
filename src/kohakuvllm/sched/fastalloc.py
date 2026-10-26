@@ -19,7 +19,7 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.request import RequestStatus
 
-log = logging.getLogger("kohakuvllm")
+log = logging.getLogger("vllm.kohakuvllm")
 
 
 def no_block_work(manager: KVCacheManager, request, num_new_tokens: int) -> bool:
@@ -54,6 +54,8 @@ def _snapshot(manager: KVCacheManager, rid: str) -> tuple:
 
 
 def install(mode: str) -> None:
+    if mode not in ("on", "check"):
+        raise ValueError(f"kohakuvllm alloc: {mode!r} is not on or check")
     original = KVCacheManager.allocate_slots
     counts = {"calls": 0, "shortcut": 0, "changed": 0}
 

@@ -6,7 +6,7 @@ steps run on random inputs through vLLM's packed decode on a bf16 pool and throu
 8-bit pool; the fp64 recurrence from the float32 states is the ruler. At steps 1, 8, ... the
 outputs and the states of every path are profiled against the ruler, side by side (no
 threshold). Slots outside the batch must stay untouched. Then CUDA-graph-replayed GPU time per
-step over batch sizes, per format and decode tile (``state8.TILE``).
+step over batch sizes, per format and decode tile (the Triton kernel's ``TILE``).
 
     python bench/gdn/state8_check.py [--hv 32] [--h 16] [--steps 64] [--batches 1,32,128,256,384]
         [--tiles 8x1,16x1,32x1,...]

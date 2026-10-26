@@ -22,6 +22,7 @@ import torch
 import vllm.ir.ops
 from vllm import _custom_ops as vops
 
+from kohakuvllm.kernels.backends.triton.nvfp4 import entry as triton_nvfp4
 from kohakuvllm.nvfp4 import ops
 
 GRID = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
@@ -65,7 +66,7 @@ def quant_case(m: int, k: int) -> dict:
     rq, rs = vops.scaled_fp4_quant(x, gs)
     row = {"op": "quant", "m": m, "k": k}
     for cvt in ("ptx", "arith"):
-        ops.CVT["name"] = cvt
+        triton_nvfp4.CVT["name"] = cvt
         q, s = ops.nvfp4_quant(x, gs)
         row[cvt] = {
             **compare_codes(q, rq, k),
@@ -86,7 +87,7 @@ def norm_case(m: int, k: int, two: bool) -> dict:
     refs = [vops.scaled_fp4_quant(rms, g) for g in gs[: 2 if two else 1]]
     row = {"op": "add_rmsnorm_x2" if two else "add_rmsnorm", "m": m, "k": k}
     for cvt in ("ptx", "arith"):
-        ops.CVT["name"] = cvt
+        triton_nvfp4.CVT["name"] = cvt
         if two:
             q0, s0, q1, s1, ores = ops.add_rmsnorm_nvfp4x2(x, r, w, eps, gs[0], gs[1])
             outs = [(q0, s0), (q1, s1)]

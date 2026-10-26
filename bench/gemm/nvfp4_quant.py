@@ -22,6 +22,7 @@ import torch
 import vllm.ir.ops
 from vllm import _custom_ops as vops
 
+from kohakuvllm.kernels.backends.triton.nvfp4 import entry as triton_nvfp4
 from kohakuvllm.nvfp4 import head, ops
 
 TOKENS = [16, 64, 384, 1024, 4096, 8192]
@@ -55,16 +56,16 @@ def graph_us(call) -> float:
 
 def best_tile(call) -> tuple[float, str, float]:
     """(fastest us, its tile, the default tile's us)."""
-    ops.TILE["value"] = None
+    triton_nvfp4.TILE["value"] = None
     default = graph_us(call)
     best = (default, "default")
     for t in TILES:
-        ops.TILE["value"] = t
+        triton_nvfp4.TILE["value"] = t
         try:
             best = min(best, (graph_us(call), "x".join(map(str, t))))
         except Exception:  # noqa: BLE001 - a tile that does not compile is skipped, not fatal
             torch.cuda.synchronize()
-    ops.TILE["value"] = None
+    triton_nvfp4.TILE["value"] = None
     return round(best[0], 2), best[1], round(default, 2)
 
 
